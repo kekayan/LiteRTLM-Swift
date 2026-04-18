@@ -24,6 +24,10 @@
 		<data>
 		dIZ4g2tJiH/zWGQFpkX2z9R0cqg=
 		</data>
+		<key>libLiteRtMetalAccelerator.dylib</key>
+		<data>
+		5DDNl4OXJQoazhwb1BbOfiw+ffI=
+		</data>
 	</dict>
 	<key>files2</key>
 	<dict>
@@ -53,6 +57,13 @@
 			<key>hash2</key>
 			<data>
 			rtXtiLGFv8fdOoM+1rfipe48qjByFGjYx44CvmARde0=
+			</data>
+		</dict>
+		<key>libLiteRtMetalAccelerator.dylib</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			3q1Jv/yvApiKgZlrgZtZLi9rKZ3r0UHNYbOazHULGu8=
 			</data>
 		</dict>
 	</dict>

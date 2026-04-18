@@ -163,6 +163,40 @@ SIM_DYLIB="$WORK_DIR/libLiteRTLMEngine-sim.dylib"
 cp "$SIM_DYLIB_SRC" "$SIM_DYLIB"
 
 # ---------------------------------------------------------------------------
+# 4b. Fetch LiteRT GPU/Metal accelerator prebuilt (not buildable from source)
+# ---------------------------------------------------------------------------
+# The Metal accelerator plugin (libLiteRtMetalAccelerator.dylib) depends on
+# Google-internal ml_drift code and is not open-sourced. Upstream ships a
+# prebuilt in the litert_prebuilts zip; we vendor it into the framework so
+# the engine's dlopen() finds it at runtime via @rpath / @loader_path.
+#
+# Without this, `litert_lm_engine_create` returns NULL for backend="gpu"
+# and the Swift wrapper falls back to CPU.
+#
+# See: https://github.com/google-ai-edge/LiteRT-LM/issues/1050
+
+PREBUILTS_URL="${LITERT_PREBUILTS_URL:-https://storage.googleapis.com/litert/binaries/latest/litert_prebuilts.zip}"
+PREBUILTS_ZIP="$WORK_DIR/litert_prebuilts.zip"
+PREBUILTS_DIR="$WORK_DIR/litert_prebuilts"
+
+info "Downloading LiteRT accelerator prebuilts..."
+curl -fL --retry 3 "$PREBUILTS_URL" -o "$PREBUILTS_ZIP"
+mkdir -p "$PREBUILTS_DIR"
+unzip -q "$PREBUILTS_ZIP" -d "$PREBUILTS_DIR"
+
+METAL_DEVICE="$PREBUILTS_DIR/ios_arm64/libLiteRtMetalAccelerator.dylib"
+METAL_SIM="$PREBUILTS_DIR/ios_sim_arm64/libLiteRtMetalAccelerator.dylib"
+
+if [ ! -f "$METAL_DEVICE" ] || [ ! -f "$METAL_SIM" ]; then
+    warn "Metal accelerator dylib not found in prebuilts zip. Contents:"
+    find "$PREBUILTS_DIR" -name 'libLiteRt*.dylib' || true
+    error "Expected ios_arm64/ and ios_sim_arm64/ libLiteRtMetalAccelerator.dylib"
+fi
+
+info "Metal device dylib: $(du -h "$METAL_DEVICE" | cut -f1)"
+info "Metal simulator dylib: $(du -h "$METAL_SIM" | cut -f1)"
+
+# ---------------------------------------------------------------------------
 # 5. Package as .framework bundles
 # ---------------------------------------------------------------------------
 
@@ -174,8 +208,9 @@ MIN_IOS="13.0"
 package_framework() {
     local ARCH_NAME="$1"  # e.g. "ios-arm64"
     local DYLIB_PATH="$2"
-    local EXTRA_DYLIB="${3:-}"
     local FW_DIR="$WORK_DIR/$ARCH_NAME/$FRAMEWORK_NAME.framework"
+    shift 2
+    local EXTRA_DYLIBS=("$@")
 
     mkdir -p "$FW_DIR/Headers" "$FW_DIR/Modules"
 
@@ -185,10 +220,16 @@ package_framework() {
     # Fix install name
     install_name_tool -id "@rpath/$FRAMEWORK_NAME.framework/$FRAMEWORK_NAME" "$FW_DIR/$FRAMEWORK_NAME"
 
-    # Copy extra dylib if present
-    if [ -n "$EXTRA_DYLIB" ] && [ -f "$EXTRA_DYLIB" ]; then
-        cp "$EXTRA_DYLIB" "$FW_DIR/"
-    fi
+    # Copy, re-id, and re-sign each extra plugin dylib so dyld resolves them
+    # via the framework's @rpath at runtime.
+    for EXTRA in "${EXTRA_DYLIBS[@]}"; do
+        [ -z "$EXTRA" ] && continue
+        [ -f "$EXTRA" ] || continue
+        local BASENAME
+        BASENAME="$(basename "$EXTRA")"
+        cp "$EXTRA" "$FW_DIR/$BASENAME"
+        install_name_tool -id "@rpath/$FRAMEWORK_NAME.framework/$BASENAME" "$FW_DIR/$BASENAME" || true
+    done
 
     # Copy headers
     cp "$HEADERS_DIR/engine.h" "$FW_DIR/Headers/"
@@ -226,20 +267,23 @@ MODULEMAP
 </plist>
 PLIST
 
-    # Ad-hoc code sign
+    # Ad-hoc code sign main binary + every embedded plugin dylib
     codesign --force --sign - "$FW_DIR/$FRAMEWORK_NAME"
-    if [ -n "$EXTRA_DYLIB" ] && [ -f "$FW_DIR/$(basename "$EXTRA_DYLIB")" ]; then
-        codesign --force --sign - "$FW_DIR/$(basename "$EXTRA_DYLIB")"
-    fi
+    for EXTRA in "${EXTRA_DYLIBS[@]}"; do
+        [ -z "$EXTRA" ] && continue
+        local BASENAME
+        BASENAME="$(basename "$EXTRA")"
+        [ -f "$FW_DIR/$BASENAME" ] && codesign --force --sign - "$FW_DIR/$BASENAME"
+    done
 
     info "Packaged $ARCH_NAME framework at $FW_DIR"
 }
 
 info "Packaging device framework..."
-package_framework "ios-arm64" "$DEVICE_DYLIB" "$CONSTRAINT_DYLIB"
+package_framework "ios-arm64" "$DEVICE_DYLIB" "$CONSTRAINT_DYLIB" "$METAL_DEVICE"
 
 info "Packaging simulator framework..."
-package_framework "ios-arm64-simulator" "$SIM_DYLIB" ""
+package_framework "ios-arm64-simulator" "$SIM_DYLIB" "" "$METAL_SIM"
 
 # ---------------------------------------------------------------------------
 # 6. Create xcframework
