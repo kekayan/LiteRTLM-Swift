@@ -48,6 +48,10 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 
     private let modelPath: URL
     private let backend: String
+    /// When `nil`, derived in `load()` from `backend` (GPU → `"gpu"`).
+    private let visionBackend: String?
+    /// When `nil`, derived in `load()` from `backend` (GPU → `"cpu"` for Gemma E2B audio adapter constraints).
+    private let audioBackend: String?
 
     private var engine: OpaquePointer?  // LiteRtLmEngine*
     private let inferenceQueue = DispatchQueue(label: "com.litertlm.inference", qos: .userInitiated)
@@ -59,10 +63,22 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     /// Create an engine instance.
     /// - Parameters:
     ///   - modelPath: Path to the `.litertlm` model file on disk.
-    ///   - backend: Compute backend — `"cpu"` or `"gpu"` (GPU uses Metal on iOS).
-    public init(modelPath: URL, backend: String = "cpu") {
+    ///   - backend: Main LM backend — `"cpu"` or `"gpu"` (GPU uses Metal on iOS).
+    ///   - visionBackend: Vision encoder backend, or `nil` to default: same as `backend`, except when
+    ///     `backend` is `"gpu"` the default is `"gpu"`.
+    ///   - audioBackend: Audio adapter backend, or `nil` to default: `"cpu"` when `backend` is `"gpu"`
+    ///     (Gemma 4 E2B `.litertlm` audio is CPU-only; forcing GPU here matches AI Edge Gallery’s split
+    ///     and avoids `Audio backend constraint mismatch`).
+    public init(
+        modelPath: URL,
+        backend: String = "cpu",
+        visionBackend: String? = nil,
+        audioBackend: String? = nil
+    ) {
         self.modelPath = modelPath
         self.backend = backend
+        self.visionBackend = visionBackend
+        self.audioBackend = audioBackend
     }
 
     deinit {
@@ -94,10 +110,17 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         guard status != .ready && status != .loading else { return }
 
         status = .loading
-        Self.log.info("Loading model: \(self.modelPath.lastPathComponent), backend: \(self.backend)")
 
         let path = modelPath.path
         let backendStr = self.backend
+        let mainLower = backendStr.lowercased()
+        let isGPU = mainLower == "gpu"
+        let visionStr = visionBackend?.lowercased() ?? (isGPU ? "gpu" : "cpu")
+        let audioStr = audioBackend?.lowercased() ?? (isGPU ? "cpu" : "cpu")
+        Self.log.info(
+            "Loading model: \(self.modelPath.lastPathComponent), backend: \(self.backend) (vision: \(visionStr), audio: \(audioStr))"
+        )
+
         let startTime = CFAbsoluteTimeGetCurrent()
 
         guard FileManager.default.fileExists(atPath: path) else {
@@ -114,7 +137,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                         litert_lm_set_min_log_level(1)
 
                         guard let settings = litert_lm_engine_settings_create(
-                            path, backendStr, backendStr, backendStr
+                            path, backendStr, visionStr, audioStr
                         ) else {
                             throw LiteRTLMError.engineCreationFailed("Failed to create engine settings")
                         }
