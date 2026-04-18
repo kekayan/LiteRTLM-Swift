@@ -64,11 +64,12 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     /// - Parameters:
     ///   - modelPath: Path to the `.litertlm` model file on disk.
     ///   - backend: Main LM backend — `"cpu"` or `"gpu"` (GPU uses Metal on iOS).
-    ///   - visionBackend: Vision encoder backend, or `nil` to default: same as `backend`, except when
-    ///     `backend` is `"gpu"` the default is `"gpu"`.
-    ///   - audioBackend: Audio adapter backend, or `nil` to default: `"cpu"` when `backend` is `"gpu"`
-    ///     (Gemma 4 E2B `.litertlm` audio is CPU-only; forcing GPU here matches AI Edge Gallery’s split
-    ///     and avoids `Audio backend constraint mismatch`).
+    ///   - visionBackend: Vision encoder backend, or `nil` to default **`"cpu"`** (including when
+    ///     `backend` is `"gpu"`). Gemma E2B vision graphs are often CPU-only in LiteRT constraints; defaulting
+    ///     vision to GPU caused `litert_lm_engine_create` failures on device while AI Edge Gallery still
+    ///     showed “GPU” for the main LM. Pass `"gpu"` explicitly if your model supports it.
+    ///   - audioBackend: Audio adapter backend, or `nil` to default **`"cpu"`** (Gemma E2B audio is CPU-only;
+    ///     avoids `Audio backend constraint mismatch` when the main backend is `"gpu"`).
     public init(
         modelPath: URL,
         backend: String = "cpu",
@@ -113,10 +114,8 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 
         let path = modelPath.path
         let backendStr = self.backend
-        let mainLower = backendStr.lowercased()
-        let isGPU = mainLower == "gpu"
-        let visionStr = visionBackend?.lowercased() ?? (isGPU ? "gpu" : "cpu")
-        let audioStr = audioBackend?.lowercased() ?? (isGPU ? "cpu" : "cpu")
+        let visionStr = visionBackend?.lowercased() ?? "cpu"
+        let audioStr = audioBackend?.lowercased() ?? "cpu"
         Self.log.info(
             "Loading model: \(self.modelPath.lastPathComponent), backend: \(self.backend) (vision: \(visionStr), audio: \(audioStr))"
         )
