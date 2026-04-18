@@ -652,6 +652,239 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         }
     }
 
+    // MARK: - Tool Calling (Mei patch)
+    //
+    // The C API on litert_lm_conversation_config_create already accepts
+    // `system_message_json`, `tools_json`, and `enable_constrained_decoding`,
+    // but the upstream wrapper passes nil for all three. The methods below
+    // expose those parameters and return the full JSON response from the
+    // model so callers can inspect `tool_calls`. They mirror the existing
+    // `openConversation` / `conversationSend` shape.
+
+    /// Open a persistent multimodal conversation with tool declarations.
+    ///
+    /// `toolsJSON` must be a JSON array of tool descriptors as documented in
+    /// the LiteRT-LM tool-use guide:
+    /// `[ { "name": "...", "description": "...", "parameters": { ... } }, ... ]`.
+    /// `systemMessage` is optional context attached to the conversation.
+    /// `enableConstrainedDecoding` turns on schema-guided decoding when the
+    /// model supports it.
+    public func openConversation(
+        systemMessage: String?,
+        toolsJSON: String?,
+        temperature: Float = 0.7,
+        maxTokens: Int = 1024,
+        enableConstrainedDecoding: Bool = false
+    ) async throws {
+        try ensureReady()
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            inferenceQueue.async { [self] in
+                do {
+                    if let c = multimodalConversation {
+                        litert_lm_conversation_delete(c)
+                        multimodalConversation = nil
+                    }
+                    if let c = multimodalConvConfig {
+                        litert_lm_conversation_config_delete(c)
+                        multimodalConvConfig = nil
+                    }
+                    if let c = multimodalSessionConfig {
+                        litert_lm_session_config_delete(c)
+                        multimodalSessionConfig = nil
+                    }
+
+                    guard let eng = engine else { throw LiteRTLMError.modelNotLoaded }
+
+                    guard let sessionConfig = litert_lm_session_config_create() else {
+                        throw LiteRTLMError.inferenceFailure("Failed to create session config")
+                    }
+                    litert_lm_session_config_set_max_output_tokens(sessionConfig, Int32(maxTokens))
+                    var samplerParams = LiteRtLmSamplerParams(
+                        type: kTopP, top_k: 40, top_p: 0.95,
+                        temperature: temperature, seed: 0
+                    )
+                    litert_lm_session_config_set_sampler_params(sessionConfig, &samplerParams)
+
+                    let systemJSON: String? = systemMessage.flatMap { msg -> String? in
+                        let payload: [String: Any] = ["role": "system", "content": msg]
+                        guard let data = try? JSONSerialization.data(withJSONObject: payload),
+                              let s = String(data: data, encoding: .utf8) else { return nil }
+                        return s
+                    }
+
+                    let convConfig: OpaquePointer? = withOptionalCString(systemJSON) { sysPtr in
+                        withOptionalCString(toolsJSON) { toolsPtr in
+                            litert_lm_conversation_config_create(
+                                eng,
+                                sessionConfig,
+                                sysPtr,
+                                toolsPtr,
+                                nil,
+                                enableConstrainedDecoding
+                            )
+                        }
+                    }
+
+                    guard let convConfig else {
+                        litert_lm_session_config_delete(sessionConfig)
+                        throw LiteRTLMError.inferenceFailure("Failed to create conversation config")
+                    }
+
+                    guard let conversation = litert_lm_conversation_create(eng, convConfig) else {
+                        litert_lm_conversation_config_delete(convConfig)
+                        litert_lm_session_config_delete(sessionConfig)
+                        throw LiteRTLMError.inferenceFailure("Failed to create conversation")
+                    }
+
+                    multimodalConversation = conversation
+                    multimodalConvConfig = convConfig
+                    multimodalSessionConfig = sessionConfig
+                    Self.log.info("Persistent conversation opened with tools")
+                    cont.resume()
+                } catch {
+                    cont.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    /// Send a text message in the persistent conversation and return the raw
+    /// JSON the model produced. Use this when you need to inspect
+    /// `tool_calls` rather than just the text reply.
+    public func conversationSendRaw(prompt: String) async throws -> String {
+        try ensureReady()
+        let messageJSON = Self.buildMultimodalMessageJSON(
+            audioPaths: [], imagePaths: [], text: prompt
+        )
+        return try await sendRawMessage(messageJSON: messageJSON)
+    }
+
+    /// Send tool execution results back to the model in the persistent
+    /// conversation. `results` are tool-name → JSON-serializable payload
+    /// pairs; each is sent as a separate `role: "tool"` message in a single
+    /// batch so the model can fold them into one follow-up turn.
+    /// Returns the model's raw JSON reply (which may be a final text answer
+    /// or another `tool_calls` round).
+    public func sendToolResults(_ results: [(toolName: String, payload: [String: Any])]) async throws -> String {
+        try ensureReady()
+        let payload: [[String: Any]] = results.map { result in
+            var content = result.payload
+            content["tool_name"] = result.toolName
+            return [
+                "role": "tool",
+                "content": content
+            ]
+        }
+
+        let messageJSON: String
+        if payload.count == 1 {
+            messageJSON = (try? JSONSerialization.data(withJSONObject: payload[0]))
+                .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+        } else {
+            // Multiple tool results — send as JSON array; LiteRT-LM accepts
+            // either a single message object or an array of messages.
+            messageJSON = (try? JSONSerialization.data(withJSONObject: payload))
+                .flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
+        }
+        return try await sendRawMessage(messageJSON: messageJSON)
+    }
+
+    /// Parse `tool_calls` out of a raw conversation JSON response.
+    /// Returns an empty array when the model produced a plain text reply.
+    public nonisolated static func parseToolCalls(from rawJSON: String) -> [ParsedToolCall] {
+        guard let data = rawJSON.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return []
+        }
+        guard let calls = obj["tool_calls"] as? [[String: Any]] else { return [] }
+        return calls.compactMap { call in
+            guard let function = call["function"] as? [String: Any],
+                  let name = function["name"] as? String else { return nil }
+            let arguments = (function["arguments"] as? [String: Any]) ?? [:]
+            let mapped = arguments.reduce(into: [String: ParsedToolArgument]()) { acc, pair in
+                acc[pair.key] = ParsedToolArgument(any: pair.value)
+            }
+            return ParsedToolCall(name: name, arguments: mapped)
+        }
+    }
+
+    /// JSON-typed argument carried alongside a parsed tool call.
+    public enum ParsedToolArgument: Sendable, Equatable {
+        case string(String)
+        case stringArray([String])
+        case bool(Bool)
+        case number(Double)
+        case null
+
+        public var stringValue: String? {
+            if case .string(let s) = self { return s }
+            return nil
+        }
+
+        public var stringArrayValue: [String]? {
+            if case .stringArray(let xs) = self { return xs }
+            return nil
+        }
+
+        init(any: Any) {
+            if any is NSNull { self = .null; return }
+            if let s = any as? String { self = .string(s); return }
+            if let xs = any as? [String] { self = .stringArray(xs); return }
+            if let xs = any as? [Any] {
+                self = .stringArray(xs.map { String(describing: $0) })
+                return
+            }
+            if let b = any as? Bool { self = .bool(b); return }
+            if let n = any as? NSNumber { self = .number(n.doubleValue); return }
+            self = .string(String(describing: any))
+        }
+    }
+
+    /// Lightweight DTO for a parsed tool call from `tool_calls`.
+    public struct ParsedToolCall: Sendable, Equatable {
+        public let name: String
+        public let arguments: [String: ParsedToolArgument]
+    }
+
+    private func sendRawMessage(messageJSON: String) async throws -> String {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, any Error>) in
+            self.inferenceQueue.async { [self] in
+                do {
+                    guard let conversation = self.multimodalConversation else {
+                        throw LiteRTLMError.inferenceFailure(
+                            "No persistent conversation open — call openConversation(...) first"
+                        )
+                    }
+
+                    guard let response = messageJSON.withCString({ msgPtr in
+                        litert_lm_conversation_send_message(conversation, msgPtr, nil)
+                    }) else {
+                        throw LiteRTLMError.inferenceFailure("Conversation returned no response")
+                    }
+                    defer { litert_lm_json_response_delete(response) }
+
+                    guard let responsePtr = litert_lm_json_response_get_string(response) else {
+                        throw LiteRTLMError.inferenceFailure("Response string is NULL")
+                    }
+                    continuation.resume(returning: String(cString: responsePtr))
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    private func withOptionalCString<R>(
+        _ string: String?,
+        _ body: (UnsafePointer<CChar>?) -> R
+    ) -> R {
+        if let string {
+            return string.withCString { body($0) }
+        } else {
+            return body(nil)
+        }
+    }
+
     /// Close the persistent multimodal conversation, freeing KV cache memory.
     public func closeConversation() {
         inferenceQueue.async { [self] in
