@@ -788,19 +788,19 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     /// Returns the model's raw JSON reply (which may be a final text answer
     /// or another `tool_calls` round).
     ///
-    /// Shape matches the Gemma chat template's tool-response path:
-    /// `{role: "tool", name: <toolName>, content: <payload>}`. The template
-    /// resolves the response block's name from the top-level `name` field and
-    /// renders `content` (dict or string) into the `<|tool_response>` block.
-    /// Nesting `tool_name` inside `content` caused the template to render
-    /// `response:unknown{...}` and the model ignored the result entirely.
+    /// Payload shape matches the LiteRT-LM Conversation API tool-use docs:
+    /// `{role: "tool", content: {tool_name: <name>, ...fields}}`. The C API
+    /// uses `content.tool_name` to correlate the response back to the prior
+    /// tool call (the model doesn't emit `tool_call_id`s).
+    /// Ref: https://github.com/google-ai-edge/LiteRT-LM/blob/main/docs/api/cpp/tool-use.md
     public func sendToolResults(_ results: [(toolName: String, payload: [String: Any])]) async throws -> String {
         try ensureReady()
         let payload: [[String: Any]] = results.map { result in
+            var content = result.payload
+            content["tool_name"] = result.toolName
             return [
                 "role": "tool",
-                "name": result.toolName,
-                "content": result.payload
+                "content": content
             ]
         }
 
