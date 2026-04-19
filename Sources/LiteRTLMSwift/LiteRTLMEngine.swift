@@ -781,6 +781,53 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         return try await sendRawMessage(messageJSON: messageJSON)
     }
 
+    /// A prior turn replayed into the conversation KV cache on the first
+    /// send of a reopened session. The C API accepts a JSON array of
+    /// messages, so we prepend these as real `role: user` / `role:
+    /// assistant` entries before the new user turn — far more reliable
+    /// than stuffing the same text into the system prompt and hoping the
+    /// model treats it as history.
+    public struct PriorTurn: Sendable {
+        public enum Role: String, Sendable { case user, assistant }
+        public let role: Role
+        public let text: String
+        public init(role: Role, text: String) {
+            self.role = role
+            self.text = text
+        }
+    }
+
+    /// Send the new user message with prior turns prefilled into the
+    /// conversation as proper role-tagged messages. Use on the first
+    /// send after `openConversation` when reopening a conversation whose
+    /// prior turns aren't yet in the engine's KV cache. Subsequent turns
+    /// in the same session should keep using `conversationSendRaw` — the
+    /// cache already carries them.
+    ///
+    /// Passing an empty `priorTurns` array is equivalent to calling
+    /// `conversationSendRaw(prompt:)` directly.
+    public func conversationSendWithHistory(
+        priorTurns: [PriorTurn],
+        newUserMessage: String
+    ) async throws -> String {
+        if priorTurns.isEmpty {
+            return try await conversationSendRaw(prompt: newUserMessage)
+        }
+        var payload: [[String: Any]] = priorTurns.map { turn in
+            [
+                "role": turn.role.rawValue,
+                "content": turn.text
+            ]
+        }
+        payload.append([
+            "role": "user",
+            "content": [["type": "text", "text": newUserMessage]]
+        ])
+        let messageJSON = (try? JSONSerialization.data(withJSONObject: payload))
+            .flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
+        return try await sendRawMessage(messageJSON: messageJSON)
+    }
+
     /// Send tool execution results back to the model in the persistent
     /// conversation. `results` are tool-name → JSON-serializable payload
     /// pairs; each is sent as a separate `role: "tool"` message in a single
