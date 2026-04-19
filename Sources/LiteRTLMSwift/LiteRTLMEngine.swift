@@ -787,14 +787,20 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     /// batch so the model can fold them into one follow-up turn.
     /// Returns the model's raw JSON reply (which may be a final text answer
     /// or another `tool_calls` round).
+    ///
+    /// Shape matches the Gemma chat template's tool-response path:
+    /// `{role: "tool", name: <toolName>, content: <payload>}`. The template
+    /// resolves the response block's name from the top-level `name` field and
+    /// renders `content` (dict or string) into the `<|tool_response>` block.
+    /// Nesting `tool_name` inside `content` caused the template to render
+    /// `response:unknown{...}` and the model ignored the result entirely.
     public func sendToolResults(_ results: [(toolName: String, payload: [String: Any])]) async throws -> String {
         try ensureReady()
         let payload: [[String: Any]] = results.map { result in
-            var content = result.payload
-            content["tool_name"] = result.toolName
             return [
                 "role": "tool",
-                "content": content
+                "name": result.toolName,
+                "content": result.payload
             ]
         }
 
