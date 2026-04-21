@@ -837,6 +837,31 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         return try await sendRawMessage(messageJSON: messageJSON)
     }
 
+    /// Shape of the `role: "tool"` message to emit to LiteRT-LM's Conversation
+    /// API. Gemma 4 E2B (LiteRT-LM v0.10.2) silently drops the default
+    /// `.contentDictWithToolName` shape — the C++ template lowers the
+    /// payload but the model never sees the values — so callers need a way
+    /// to experiment with alternate shapes until upstream lands a fix.
+    public enum ToolResultPayloadShape: Sendable {
+        /// `{role:"tool", content:{tool_name, ...payload}}` — matches the
+        /// LiteRT-LM tool-use doc. Default for backwards compatibility.
+        case contentDictWithToolName
+        /// `{role:"tool", name:<toolName>, content:<payload-dict>}`.
+        /// Tried in mei.5, reverted because the C template rendered
+        /// `response:unknown{...}`.
+        case nameAndContentDict
+        /// `{role:"tool", name:<toolName>, content:"<stringified-payload>"}`
+        /// — OpenAI-classic, flat-string content.
+        case nameAndContentString
+        /// `{role:"tool", content:[{type:"text", text:"<stringified-payload>"}]}`
+        /// — mirrors the shape the user-role path uses. Hypothesis: the C
+        /// template's content walker only renders typed-part arrays.
+        case contentArrayTyped
+        /// `{role:"tool", name:<toolName>, content:[{type:"text", text:"..."}]}`
+        /// — union of `.nameAndContentString` and `.contentArrayTyped`.
+        case nameAndContentArrayTyped
+    }
+
     /// Send tool execution results back to the model in the persistent
     /// conversation. `results` are tool-name → JSON-serializable payload
     /// pairs; each is sent as a separate `role: "tool"` message in a single
@@ -844,37 +869,82 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     /// Returns the model's raw JSON reply (which may be a final text answer
     /// or another `tool_calls` round).
     ///
-    /// Payload shape matches the LiteRT-LM Conversation API tool-use docs:
-    /// `{role: "tool", content: {tool_name: <name>, ...fields}}`. The C API
-    /// uses `content.tool_name` to correlate the response back to the prior
-    /// tool call (the model doesn't emit `tool_call_id`s).
+    /// `shape` selects the `role: "tool"` message shape. Defaults to the
+    /// LiteRT-LM tool-use doc shape. See `ToolResultPayloadShape` for
+    /// alternatives to try when the default is silently dropped.
     /// Ref: https://github.com/google-ai-edge/LiteRT-LM/blob/main/docs/api/cpp/tool-use.md
-    public func sendToolResults(_ results: [(toolName: String, payload: [String: Any])]) async throws -> String {
+    public func sendToolResults(
+        _ results: [(toolName: String, payload: [String: Any])],
+        shape: ToolResultPayloadShape = .contentDictWithToolName
+    ) async throws -> String {
         try ensureReady()
-        let payload: [[String: Any]] = results.map { result in
-            var content = result.payload
-            content["tool_name"] = result.toolName
-            return [
-                "role": "tool",
-                "content": content
-            ]
+        let messages: [[String: Any]] = results.map { result in
+            Self.buildToolResultMessage(toolName: result.toolName, payload: result.payload, shape: shape)
         }
 
         let messageJSON: String
-        if payload.count == 1 {
-            messageJSON = (try? JSONSerialization.data(withJSONObject: payload[0]))
+        if messages.count == 1 {
+            messageJSON = (try? JSONSerialization.data(withJSONObject: messages[0]))
                 .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
         } else {
             // Multiple tool results — send as JSON array; LiteRT-LM accepts
             // either a single message object or an array of messages.
-            messageJSON = (try? JSONSerialization.data(withJSONObject: payload))
+            messageJSON = (try? JSONSerialization.data(withJSONObject: messages))
                 .flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
         }
         return try await sendRawMessage(messageJSON: messageJSON)
     }
 
+    private nonisolated static func buildToolResultMessage(
+        toolName: String,
+        payload: [String: Any],
+        shape: ToolResultPayloadShape
+    ) -> [String: Any] {
+        switch shape {
+        case .contentDictWithToolName:
+            var content = payload
+            content["tool_name"] = toolName
+            return ["role": "tool", "content": content]
+        case .nameAndContentDict:
+            return ["role": "tool", "name": toolName, "content": payload]
+        case .nameAndContentString:
+            return ["role": "tool", "name": toolName, "content": stringifyToolPayload(payload)]
+        case .contentArrayTyped:
+            return [
+                "role": "tool",
+                "content": [["type": "text", "text": stringifyToolPayload(payload)]]
+            ]
+        case .nameAndContentArrayTyped:
+            return [
+                "role": "tool",
+                "name": toolName,
+                "content": [["type": "text", "text": stringifyToolPayload(payload)]]
+            ]
+        }
+    }
+
+    /// Collapse a tool payload dict to a readable string. When the dict has a
+    /// single natural-text field (`output`/`result`/`text`/`content`) we inline
+    /// the value so the model doesn't have to parse JSON; otherwise we fall
+    /// back to a JSON encoding.
+    private nonisolated static func stringifyToolPayload(_ payload: [String: Any]) -> String {
+        let textKeys: Set<String> = ["output", "result", "text", "content"]
+        if payload.count == 1, let key = payload.keys.first, textKeys.contains(key),
+           let text = payload[key] as? String {
+            return text
+        }
+        if let data = try? JSONSerialization.data(withJSONObject: payload),
+           let s = String(data: data, encoding: .utf8) {
+            return s
+        }
+        return String(describing: payload)
+    }
+
     /// Parse `tool_calls` out of a raw conversation JSON response.
     /// Returns an empty array when the model produced a plain text reply.
+    /// String values are scrubbed of Gemma-4 string-delimiter sentinels
+    /// (`<|"|>`, `<|'|>`) the detokenizer sometimes leaks into argument
+    /// bodies.
     public nonisolated static func parseToolCalls(from rawJSON: String) -> [ParsedToolCall] {
         guard let data = rawJSON.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -888,8 +958,19 @@ public final class LiteRTLMEngine: @unchecked Sendable {
             let mapped = arguments.reduce(into: [String: ParsedToolArgument]()) { acc, pair in
                 acc[pair.key] = ParsedToolArgument(any: pair.value)
             }
-            return ParsedToolCall(name: name, arguments: mapped)
+            return ParsedToolCall(name: stripSentinels(name), arguments: mapped)
         }
+    }
+
+    /// Strip Gemma-4 string-delimiter sentinels (`<|"|>`, `<|'|>`) that
+    /// sometimes leak into decoded tool-call string values. Callers can run
+    /// this over any raw model text to get the intended value.
+    public nonisolated static func stripSentinels(_ raw: String) -> String {
+        var out = raw
+        for token in ["<|\"|>", "<|'|>"] {
+            out = out.replacingOccurrences(of: token, with: "")
+        }
+        return out.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// JSON-typed argument carried alongside a parsed tool call.
@@ -912,15 +993,21 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 
         init(any: Any) {
             if any is NSNull { self = .null; return }
-            if let s = any as? String { self = .string(s); return }
-            if let xs = any as? [String] { self = .stringArray(xs); return }
+            if let s = any as? String {
+                self = .string(LiteRTLMEngine.stripSentinels(s))
+                return
+            }
+            if let xs = any as? [String] {
+                self = .stringArray(xs.map(LiteRTLMEngine.stripSentinels))
+                return
+            }
             if let xs = any as? [Any] {
-                self = .stringArray(xs.map { String(describing: $0) })
+                self = .stringArray(xs.map { LiteRTLMEngine.stripSentinels(String(describing: $0)) })
                 return
             }
             if let b = any as? Bool { self = .bool(b); return }
             if let n = any as? NSNumber { self = .number(n.doubleValue); return }
-            self = .string(String(describing: any))
+            self = .string(LiteRTLMEngine.stripSentinels(String(describing: any)))
         }
     }
 
