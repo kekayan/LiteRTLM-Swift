@@ -210,6 +210,64 @@ let answer = try await engine.conversationSend(
 engine.closeConversation()
 ```
 
+### Tool Calling (Gemma 4)
+
+Gemma 4 can emit structured tool calls. Declare tools with JSON-Schema `parameters`, open a conversation with them, and round-trip tool results back to the model. Constrained decoding is auto-enabled when you pass tools; pass `enableConstrainedDecoding: false` to opt out.
+
+```swift
+let getWeather = LiteRTLMTool(
+    name: "get_weather",
+    description: "Look up the current weather for a city.",
+    parametersJSONSchema: """
+    { "type": "object",
+      "properties": { "city": { "type": "string", "description": "City name" } },
+      "required": ["city"] }
+    """
+)
+
+try await engine.openConversation(
+    systemPrompt: "You are a helpful assistant.",
+    tools: [getWeather],
+    temperature: 0.2
+)
+
+switch try await engine.conversationSendTurn(prompt: "What's the weather in Tokyo?") {
+case .text(let reply):
+    print(reply)
+case .toolCalls(let calls):
+    // Execute tools locally, then send results back
+    let results: [(String, [String: Any])] = calls.map { call in
+        let city = call.arguments["city"]?.stringValue ?? "Unknown"
+        return (call.name, ["temperature_c": 18, "conditions": "cloudy", "city": city])
+    }
+    switch try await engine.sendToolResultsTurn(results) {
+    case .text(let final): print(final)
+    case .toolCalls: print("Model requested more tool calls")
+    }
+}
+```
+
+### Thinking Mode (Gemma 4)
+
+Enable thinking to see the model's reasoning before its final answer. Thoughts stream on a separate channel so the UI can present them distinctly. Past thoughts are auto-stripped from KV context on the next turn, so there's no cache-reuse penalty.
+
+```swift
+try await engine.openConversation(
+    systemPrompt: "Solve problems step-by-step.",
+    enableThinking: true
+)
+
+for try await event in engine.conversationSendTurnStreaming(
+    prompt: "A train leaves at 3pm going 80 km/h. Another leaves 1h later at 100 km/h. When does it catch up?"
+) {
+    switch event {
+    case .thought(let t): print("[thinking] \(t)", terminator: "")
+    case .text(let text): print(text, terminator: "")
+    case .toolCalls(let calls): print("tool calls: \(calls)")
+    }
+}
+```
+
 ### Download Progress Tracking
 
 `ModelDownloader` is `@Observable`, so you can bind directly in SwiftUI:
@@ -287,7 +345,12 @@ struct EngineView: View {
 | `sessionGenerateStreaming(input:)` | Stream generation using persistent text session |
 | `closeSession()` | Close persistent text session, free KV cache |
 | `openConversation(temperature:maxTokens:)` | Open persistent multimodal conversation (KV cache reuse) |
+| `openConversation(systemPrompt:tools:enableConstrainedDecoding:enableThinking:temperature:maxTokens:)` | Open conversation with typed tools and/or thinking mode (Gemma 4) |
 | `conversationSend(audioData:audioFormat:imagesData:prompt:maxImageDimension:)` | Send a turn in the persistent conversation (any mix of audio/images/text) |
+| `conversationSendTurn(prompt:)` | Send a turn and receive a typed `.text` / `.toolCalls` result |
+| `conversationSendTurnStreaming(prompt:)` | Stream a turn as `LiteRTLMStreamEvent` (`.text` / `.thought` / `.toolCalls`) |
+| `sendToolResultsTurn(_:)` | Send typed tool results and receive the follow-up turn |
+| `cancelConversation()` | Cancel an in-flight conversation send |
 | `closeConversation()` | Close persistent multimodal conversation, free KV cache |
 
 | Property | Type | Description |
