@@ -524,6 +524,12 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     private var multimodalConvConfig: OpaquePointer?
     private var multimodalSessionConfig: OpaquePointer?
 
+    /// Set by `openConversation(...)` when `enableThinking: true`. Threaded as
+    /// the `extra_context` JSON argument (`{"enable_thinking":true}`) on every
+    /// subsequent send call. The Gemma 4 template auto-strips prior thoughts
+    /// from KV context on the next turn, so there's no cache-reuse penalty.
+    private var conversationThinkingEnabled: Bool = false
+
     /// Open a persistent multimodal conversation with KV cache reuse.
     ///
     /// Call once when a conversation begins. Subsequent calls to
@@ -551,6 +557,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                         litert_lm_session_config_delete(c)
                         multimodalSessionConfig = nil
                     }
+                    conversationThinkingEnabled = false
 
                     guard let eng = engine else { throw LiteRTLMError.modelNotLoaded }
 
@@ -696,7 +703,8 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         toolsJSON: String?,
         temperature: Float = 0.7,
         maxTokens: Int = 1024,
-        enableConstrainedDecoding: Bool = false
+        enableConstrainedDecoding: Bool = false,
+        enableThinking: Bool = false
     ) async throws {
         try ensureReady()
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
@@ -714,6 +722,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                         litert_lm_session_config_delete(c)
                         multimodalSessionConfig = nil
                     }
+                    conversationThinkingEnabled = enableThinking
 
                     guard let eng = engine else { throw LiteRTLMError.modelNotLoaded }
 
@@ -921,18 +930,92 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         public let arguments: [String: ParsedToolArgument]
     }
 
-    private func sendRawMessage(messageJSON: String) async throws -> String {
+    // MARK: - Typed Tool Calling (Gemma 4)
+    //
+    // Convenience layer over the raw-JSON tool-use methods above. Callers work
+    // with Swift structs instead of hand-rolling the OpenAI-shape tools array
+    // and re-parsing the response JSON on every turn.
+
+    /// Open a persistent conversation with typed tool declarations and optional
+    /// thinking mode.
+    ///
+    /// - Parameters:
+    ///   - systemPrompt: Optional system message prefixed to the conversation.
+    ///   - tools: Tool declarations. Empty array means "no tools."
+    ///   - enableConstrainedDecoding: If `nil` (default), auto-enabled when
+    ///     `tools` is non-empty. Pass `false` explicitly to disable grammar
+    ///     constraints even with tools declared. Never auto-enabled when no
+    ///     tools are present — library versions have been observed to hang
+    ///     when constrained decoding is on but no tools are declared.
+    ///   - enableThinking: When `true`, every subsequent send emits thought
+    ///     tokens before the final answer. Requires a Gemma 4 model.
+    public func openConversation(
+        systemPrompt: String? = nil,
+        tools: [LiteRTLMTool] = [],
+        enableConstrainedDecoding: Bool? = nil,
+        enableThinking: Bool = false,
+        temperature: Float = 0.7,
+        maxTokens: Int = 1024
+    ) async throws {
+        let toolsJSON: String? = tools.isEmpty ? nil : try buildToolsJSON(tools)
+        let constrain = enableConstrainedDecoding ?? !tools.isEmpty
+        try await openConversation(
+            systemMessage: systemPrompt,
+            toolsJSON: toolsJSON,
+            temperature: temperature,
+            maxTokens: maxTokens,
+            enableConstrainedDecoding: constrain,
+            enableThinking: enableThinking
+        )
+    }
+
+    /// Send a user turn and receive a typed `LiteRTLMTurn`. If the model chose
+    /// to call tools, the `.toolCalls` case carries the parsed invocations;
+    /// otherwise `.text` carries the final answer.
+    public func conversationSendTurn(prompt: String) async throws -> LiteRTLMTurn {
+        let rawJSON = try await conversationSendRaw(prompt: prompt)
+        return Self.parseTurn(rawJSON: rawJSON)
+    }
+
+    /// Send tool execution results and receive the model's typed follow-up
+    /// turn. The follow-up may be another round of tool calls or a final
+    /// text answer — inspect the returned `LiteRTLMTurn`.
+    public func sendToolResultsTurn(
+        _ results: [(toolName: String, payload: [String: Any])]
+    ) async throws -> LiteRTLMTurn {
+        let rawJSON = try await sendToolResults(results)
+        return Self.parseTurn(rawJSON: rawJSON)
+    }
+
+    /// Parse a raw conversation JSON response into a typed turn. Returns
+    /// `.toolCalls` when the payload carries a `tool_calls` array, otherwise
+    /// `.text` with the extracted text content.
+    nonisolated static func parseTurn(rawJSON: String) -> LiteRTLMTurn {
+        let toolCalls = parseToolCalls(from: rawJSON)
+        if !toolCalls.isEmpty { return .toolCalls(toolCalls) }
+        return .text(extractTextFromConversationResponse(rawJSON))
+    }
+
+    private func sendRawMessage(
+        messageJSON: String,
+        extraContextJSON: String? = nil
+    ) async throws -> String {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, any Error>) in
             self.inferenceQueue.async { [self] in
                 do {
                     guard let conversation = self.multimodalConversation else {
-                        throw LiteRTLMError.inferenceFailure(
-                            "No persistent conversation open — call openConversation(...) first"
-                        )
+                        throw LiteRTLMError.noConversationOpen
                     }
 
-                    guard let response = messageJSON.withCString({ msgPtr in
-                        litert_lm_conversation_send_message(conversation, msgPtr, nil)
+                    // Caller-supplied context wins; otherwise fall back to the
+                    // thinking flag captured at openConversation time.
+                    let effectiveContext = extraContextJSON
+                        ?? (self.conversationThinkingEnabled ? "{\"enable_thinking\":true}" : nil)
+
+                    guard let response = messageJSON.withCString({ msgPtr -> OpaquePointer? in
+                        withOptionalCString(effectiveContext) { ctxPtr in
+                            litert_lm_conversation_send_message(conversation, msgPtr, ctxPtr)
+                        }
                     }) else {
                         throw LiteRTLMError.inferenceFailure("Conversation returned no response")
                     }
@@ -960,6 +1043,146 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         }
     }
 
+    /// Stream a user turn as typed events (`.text`, `.thought`, `.toolCalls`).
+    ///
+    /// The underlying C API delivers plain-text chunks. We attempt to parse
+    /// each chunk as JSON first — that's how tool-call chunks and the Gemma 4
+    /// `channels.thought` payload arrive when thinking mode is on. Non-JSON
+    /// chunks are surfaced verbatim as `.text`. The full accumulated output is
+    /// re-parsed at stream-end in case the model emitted one final `tool_calls`
+    /// JSON object split across chunks.
+    ///
+    /// Cancel in flight via `litert_lm_conversation_cancel_process` by calling
+    /// `cancelConversation()`.
+    public func conversationSendTurnStreaming(
+        prompt: String
+    ) -> AsyncThrowingStream<LiteRTLMStreamEvent, Error> {
+        AsyncThrowingStream { continuation in
+            self.inferenceQueue.async { [self] in
+                guard let conversation = self.multimodalConversation else {
+                    continuation.finish(throwing: LiteRTLMError.noConversationOpen)
+                    return
+                }
+
+                let messageJSON = Self.buildMultimodalMessageJSON(
+                    audioPaths: [], imagePaths: [], text: prompt
+                )
+                let extraContext: String? = self.conversationThinkingEnabled
+                    ? "{\"enable_thinking\":true}" : nil
+
+                let streamDone = DispatchSemaphore(value: 0)
+                let state = ConversationStreamState(continuation: continuation, doneSemaphore: streamDone)
+                let statePtr = Unmanaged.passRetained(state).toOpaque()
+
+                let result = messageJSON.withCString { msgPtr -> Int32 in
+                    withOptionalCString(extraContext) { ctxPtr in
+                        litert_lm_conversation_send_message_stream(
+                            conversation, msgPtr, ctxPtr,
+                            { callbackData, chunk, isFinal, errorMsg in
+                                guard let cbData = callbackData else { return }
+                                let st = Unmanaged<ConversationStreamState>.fromOpaque(cbData)
+                                    .takeUnretainedValue()
+
+                                let errorMessage: String? = {
+                                    guard let errorMsg else { return nil }
+                                    let msg = String(cString: errorMsg)
+                                    return msg.isEmpty ? nil : msg
+                                }()
+
+                                if let chunk, errorMessage == nil {
+                                    let text = String(cString: chunk)
+                                    if !text.isEmpty {
+                                        st.buffer.append(text)
+                                        for event in LiteRTLMEngine.streamEvents(fromChunk: text) {
+                                            if case .toolCalls = event { st.yieldedToolCalls = true }
+                                            st.continuation.yield(event)
+                                        }
+                                    }
+                                }
+
+                                if isFinal || errorMessage != nil {
+                                    if let error = errorMessage {
+                                        st.continuation.finish(throwing: LiteRTLMError.inferenceFailure(error))
+                                    } else {
+                                        // Final pass: if the whole payload parses as a
+                                        // tool_calls envelope, surface them. This covers
+                                        // libraries that stream the tool-call JSON across
+                                        // chunks without per-chunk parseability.
+                                        let full = st.buffer
+                                        let toolCalls = LiteRTLMEngine.parseToolCalls(from: full)
+                                        if !toolCalls.isEmpty && !st.yieldedToolCalls {
+                                            st.continuation.yield(.toolCalls(toolCalls))
+                                        }
+                                        st.continuation.finish()
+                                    }
+                                    let semaphore = st.doneSemaphore
+                                    Unmanaged<ConversationStreamState>.fromOpaque(cbData).release()
+                                    semaphore.signal()
+                                }
+                            },
+                            statePtr
+                        )
+                    }
+                }
+
+                if result != 0 {
+                    Unmanaged<ConversationStreamState>.fromOpaque(statePtr).release()
+                    continuation.finish(throwing: LiteRTLMError.inferenceFailure("Failed to start conversation stream"))
+                    return
+                }
+
+                streamDone.wait()
+            }
+        }
+    }
+
+    /// Cancel an in-flight streaming or blocking conversation send. Safe to
+    /// call when no send is in flight.
+    public func cancelConversation() {
+        inferenceQueue.async { [self] in
+            if let conversation = multimodalConversation {
+                litert_lm_conversation_cancel_process(conversation)
+            }
+        }
+    }
+
+    /// Per-chunk event parser used by the streaming path. Tries JSON first
+    /// (to surface structured `channels.thought` / `tool_calls` chunks),
+    /// falls back to emitting a single `.text` event.
+    nonisolated static func streamEvents(fromChunk chunk: String) -> [LiteRTLMStreamEvent] {
+        guard let data = chunk.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return [.text(chunk)]
+        }
+
+        var events: [LiteRTLMStreamEvent] = []
+
+        if let channels = obj["channels"] as? [String: Any],
+           let thought = channels["thought"] as? String, !thought.isEmpty {
+            events.append(.thought(thought))
+        }
+        if let thought = obj["thought"] as? String, !thought.isEmpty {
+            events.append(.thought(thought))
+        }
+
+        let calls = parseToolCalls(from: chunk)
+        if !calls.isEmpty {
+            events.append(.toolCalls(calls))
+        }
+
+        if let content = obj["content"] as? [[String: Any]] {
+            for part in content {
+                if let text = part["text"] as? String, !text.isEmpty {
+                    events.append(.text(text))
+                }
+            }
+        } else if let text = obj["text"] as? String, !text.isEmpty {
+            events.append(.text(text))
+        }
+
+        return events.isEmpty ? [.text(chunk)] : events
+    }
+
     /// Close the persistent multimodal conversation, freeing KV cache memory.
     public func closeConversation() {
         inferenceQueue.async { [self] in
@@ -976,6 +1199,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                 litert_lm_session_config_delete(c)
                 multimodalSessionConfig = nil
             }
+            conversationThinkingEnabled = false
             Self.log.info("Persistent multimodal conversation closed")
         }
     }
@@ -1432,6 +1656,25 @@ private final class StreamCallbackState: @unchecked Sendable {
     }
 }
 
+/// Typed-event stream state used by `conversationSendTurnStreaming`.
+///
+/// Accessed only from the single LiteRT-LM callback thread, so the mutable
+/// `buffer` / `yieldedToolCalls` fields don't need synchronization. The class
+/// is `@unchecked Sendable` to satisfy the closure capture, matching the
+/// existing `StreamCallbackState` pattern above.
+private final class ConversationStreamState: @unchecked Sendable {
+    let continuation: AsyncThrowingStream<LiteRTLMStreamEvent, Error>.Continuation
+    let doneSemaphore: DispatchSemaphore
+    var buffer: String = ""
+    var yieldedToolCalls: Bool = false
+
+    init(continuation: AsyncThrowingStream<LiteRTLMStreamEvent, Error>.Continuation,
+         doneSemaphore: DispatchSemaphore) {
+        self.continuation = continuation
+        self.doneSemaphore = doneSemaphore
+    }
+}
+
 // MARK: - Errors
 
 public enum LiteRTLMError: LocalizedError {
@@ -1439,6 +1682,9 @@ public enum LiteRTLMError: LocalizedError {
     case modelNotLoaded
     case engineCreationFailed(String)
     case inferenceFailure(String)
+    case invalidToolSchema(toolName: String, detail: String)
+    case noConversationOpen
+    case malformedToolCallFromModel(rawJSON: String)
 
     public var errorDescription: String? {
         switch self {
@@ -1450,6 +1696,12 @@ public enum LiteRTLMError: LocalizedError {
             "Failed to create LiteRT-LM engine: \(detail)"
         case .inferenceFailure(let detail):
             "LiteRT-LM inference failed: \(detail)"
+        case .invalidToolSchema(let name, let detail):
+            "Invalid tool schema for '\(name)': \(detail)"
+        case .noConversationOpen:
+            "No persistent conversation open — call openConversation(...) first"
+        case .malformedToolCallFromModel(let rawJSON):
+            "Model produced a tool_call the wrapper could not parse. Raw: \(rawJSON)"
         }
     }
 }
