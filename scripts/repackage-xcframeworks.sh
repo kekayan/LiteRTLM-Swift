@@ -47,9 +47,11 @@ error() { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 # Google's prebuilt Gemma dylib ships with minos=26.2 which would refuse to
 # load on any device running iOS < 26.2 (the minimum mei supports is 17.0).
 # Metal dylib already has minos=14.0 so this is a no-op for it.
+# -tool 3 1230.1 adds an ld tool entry; App Store validation (ITMS-90208)
+# rejects framework binaries whose LC_BUILD_VERSION has ntools=0.
 set_ios_min() {
     local BIN="$1" PLATFORM="$2"  # PLATFORM: ios or iossim
-    xcrun vtool -set-build-version "$PLATFORM" 17.0 26.2 -replace -output "$BIN" "$BIN" >/dev/null
+    xcrun vtool -set-build-version "$PLATFORM" 17.0 26.2 -tool 3 1230.1 -replace -output "$BIN" "$BIN" >/dev/null
 }
 
 [ -d "$SRC_XCF" ] || error "Source xcframework missing: $SRC_XCF"
@@ -101,14 +103,21 @@ write_plist() {
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+    <key>CFBundleDevelopmentRegion</key><string>en</string>
     <key>CFBundleExecutable</key><string>$EXEC</string>
     <key>CFBundleIdentifier</key><string>$IDENT</string>
     <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
     <key>CFBundleName</key><string>$NAME</string>
     <key>CFBundlePackageType</key><string>FMWK</string>
     <key>CFBundleShortVersionString</key><string>1.0.0</string>
+    <key>CFBundleSupportedPlatforms</key>
+    <array><string>iPhoneOS</string></array>
     <key>CFBundleVersion</key><string>1</string>
-    <key>MinimumOSVersion</key><string>13.0</string>
+    <key>DTCompiler</key><string>com.apple.compilers.llvm.clang.1_0</string>
+    <key>DTPlatformName</key><string>iphoneos</string>
+    <key>DTPlatformVersion</key><string>17.0</string>
+    <key>DTSDKName</key><string>iphoneos17.0</string>
+    <key>MinimumOSVersion</key><string>17.0</string>
 </dict>
 </plist>
 PLIST
