@@ -54,7 +54,14 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     private let audioBackend: String?
 
     private var engine: OpaquePointer?  // LiteRtLmEngine*
-    private let inferenceQueue = DispatchQueue(label: "com.litertlm.inference", qos: .userInitiated)
+    /// `.default` QoS is deliberate: the streaming paths below block on a
+    /// `DispatchSemaphore` that the LiteRT-LM C library signals from its own
+    /// worker thread (observed at `.default` QoS). Running this queue at
+    /// `.userInitiated` triggers a runtime priority-inversion warning each
+    /// time a stream starts. The dispatch queue is only a serialization
+    /// point — actual inference runs on the C library's internal threads —
+    /// so dropping to `.default` has no measurable latency effect.
+    private let inferenceQueue = DispatchQueue(label: "com.litertlm.inference", qos: .default)
 
     private static let log = Logger(subsystem: "LiteRTLMSwift", category: "Engine")
 
