@@ -1164,6 +1164,66 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     public func conversationSendTurnStreaming(
         prompt: String
     ) -> AsyncThrowingStream<LiteRTLMStreamEvent, Error> {
+        let messageJSON = Self.buildMultimodalMessageJSON(
+            audioPaths: [], imagePaths: [], text: prompt
+        )
+        return sendRawMessageStreaming(messageJSON: messageJSON)
+    }
+
+    /// Streaming counterpart to `conversationSendWithHistory`. Replays prior
+    /// turns into the open conversation as proper role-tagged messages and
+    /// streams the model's reply as typed events. Use on the first send
+    /// after `openConversation` when reopening a conversation whose prior
+    /// turns aren't yet in the engine's KV cache.
+    public func conversationSendWithHistoryStreaming(
+        priorTurns: [PriorTurn],
+        newUserMessage: String
+    ) -> AsyncThrowingStream<LiteRTLMStreamEvent, Error> {
+        if priorTurns.isEmpty {
+            return conversationSendTurnStreaming(prompt: newUserMessage)
+        }
+        var payload: [[String: Any]] = priorTurns.map { turn in
+            [
+                "role": turn.role.rawValue,
+                "content": turn.text
+            ]
+        }
+        payload.append([
+            "role": "user",
+            "content": [["type": "text", "text": newUserMessage]]
+        ])
+        let messageJSON = (try? JSONSerialization.data(withJSONObject: payload))
+            .flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
+        return sendRawMessageStreaming(messageJSON: messageJSON)
+    }
+
+    /// Streaming counterpart to `sendToolResults`. Submits one or more
+    /// `role: "tool"` messages and streams the model's follow-up reply
+    /// (which may itself be another `tool_calls` round). Same `shape`
+    /// semantics as `sendToolResults`.
+    public func sendToolResultsStreaming(
+        _ results: [(toolName: String, payload: [String: Any])],
+        shape: ToolResultPayloadShape = .contentDictWithToolName
+    ) -> AsyncThrowingStream<LiteRTLMStreamEvent, Error> {
+        let messages: [[String: Any]] = results.map { result in
+            Self.buildToolResultMessage(toolName: result.toolName, payload: result.payload, shape: shape)
+        }
+        let messageJSON: String
+        if messages.count == 1 {
+            messageJSON = (try? JSONSerialization.data(withJSONObject: messages[0]))
+                .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+        } else {
+            messageJSON = (try? JSONSerialization.data(withJSONObject: messages))
+                .flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
+        }
+        return sendRawMessageStreaming(messageJSON: messageJSON)
+    }
+
+    /// Shared streaming primitive. Owns the C callback bridge so the public
+    /// streaming entry points stay focused on building their message JSON.
+    private func sendRawMessageStreaming(
+        messageJSON: String
+    ) -> AsyncThrowingStream<LiteRTLMStreamEvent, Error> {
         AsyncThrowingStream { continuation in
             self.inferenceQueue.async { [self] in
                 guard let conversation = self.multimodalConversation else {
@@ -1171,9 +1231,6 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                     return
                 }
 
-                let messageJSON = Self.buildMultimodalMessageJSON(
-                    audioPaths: [], imagePaths: [], text: prompt
-                )
                 let extraContext: String? = self.conversationThinkingEnabled
                     ? "{\"enable_thinking\":true}" : nil
 
