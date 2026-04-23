@@ -51,6 +51,36 @@ targets: [
 
 Or in Xcode: File > Add Package Dependencies > paste the repo URL > add `LiteRTLMSwift` to your target.
 
+### GPU backend: install_name patch
+
+If you pass `backend: "gpu"` to `LiteRTLMEngine`, add a **Run Script** build phase to your app target that runs after the frameworks are embedded. Without it, the engine's `dlopen("libLiteRtMetalAccelerator.dylib")` misses the already-loaded Metal plugin and the backend silently falls back to CPU (you'll see `gpu_registry.cc:187 GPU accelerator could not be loaded and registered` followed by `litert_lm_engine_create returned NULL`).
+
+**Why it's needed:** `ld -framework LiteRtMetalAccelerator` requires the binary to be named `LiteRtMetalAccelerator` (not `libLiteRtMetalAccelerator.dylib`) inside the framework, so the shipped xcframework uses that name. But the LiteRT-LM engine dlopens plugins by the bare leaf `libLiteRtMetalAccelerator.dylib` — a name that, by default, never appears as any loaded image's install_name. Patching the embedded binary's install_name to the bare leaf post-embed fixes the mismatch without breaking link-time framework discovery.
+
+In the app target's **Build Phases** tab, add a new **Run Script Phase** after **Embed Frameworks** (declare the framework binary as an input so Xcode schedules it correctly):
+
+**Input File:**
+```
+$(BUILT_PRODUCTS_DIR)/$(FRAMEWORKS_FOLDER_PATH)/LiteRtMetalAccelerator.framework/LiteRtMetalAccelerator
+```
+
+**Script:**
+```sh
+set -e
+FW="$BUILT_PRODUCTS_DIR/$FRAMEWORKS_FOLDER_PATH/LiteRtMetalAccelerator.framework/LiteRtMetalAccelerator"
+[ -f "$FW" ] || exit 0
+DESIRED="libLiteRtMetalAccelerator.dylib"
+[ "$(otool -D "$FW" | tail -1)" = "$DESIRED" ] && exit 0
+install_name_tool -id "$DESIRED" "$FW"
+codesign --force --sign "${EXPANDED_CODE_SIGN_IDENTITY:--}" "$FW"
+```
+
+Tick **"Based on dependency analysis"** off (or set `alwaysOutOfDate = 1` in the pbxproj) so the phase always runs — the patch must survive an unpatched fresh embed after a clean build.
+
+At launch, dyld resolves the app's pre-patch `LC_LOAD_DYLIB @rpath/LiteRtMetalAccelerator.framework/LiteRtMetalAccelerator` via rpath, loads the file, and indexes the loaded image under the new `LC_ID_DYLIB libLiteRtMetalAccelerator.dylib`. When the engine later calls `dlopen("libLiteRtMetalAccelerator.dylib")`, dyld's install-name cache answers with the existing handle and the plugin registers. You should see `Statically linked GPU accelerator registered.` (or `Dynamically loaded GPU accelerator(libLiteRtMetalAccelerator.dylib) registered.`) in the console instead of the fallback warning.
+
+If you only ever use `backend: "cpu"` (the default), you don't need this phase.
+
 ## Quick Start
 
 A complete end-to-end example:
