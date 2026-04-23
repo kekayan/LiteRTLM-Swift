@@ -58,10 +58,11 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 
     private static let log = Logger(subsystem: "LiteRTLMSwift", category: "Engine")
 
-    // The C++ engine dlopen's "libLiteRtMetalAccelerator.dylib" by leaf name.
-    // We load the sibling framework's binary by full path so dyld caches it
-    // under its install_name (set to that bare leaf during packaging); the
-    // engine's later leaf-name dlopen then hits that cache.
+    // Belt-and-braces Metal preload. The framework auto-loads at launch via
+    // LC_LOAD_DYLIB so its symbols are in the process namespace; this dlopen
+    // is a no-op in that case. It only matters if a consumer ever configures
+    // the framework as "embed without link" (no LC_LOAD_DYLIB) — then this
+    // ensures Metal is still available when the engine tries to use it.
     private static let preloadPlugins: Void = {
         guard let frameworksPath = Bundle.main.privateFrameworksPath else { return }
         let metalPath = "\(frameworksPath)/LiteRtMetalAccelerator.framework/LiteRtMetalAccelerator"

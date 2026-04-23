@@ -43,12 +43,40 @@ NC='\033[0m'
 info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
 error() { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 
+# Rewrite LC_BUILD_VERSION so the dylib advertises iOS 17 as its minimum.
+# Google's prebuilt Gemma dylib ships with minos=26.2 which would refuse to
+# load on any device running iOS < 26.2 (the minimum mei supports is 17.0).
+# Metal dylib already has minos=14.0 so this is a no-op for it.
+set_ios_min() {
+    local BIN="$1" PLATFORM="$2"  # PLATFORM: ios or iossim
+    xcrun vtool -set-build-version "$PLATFORM" 17.0 26.2 -replace -output "$BIN" "$BIN" >/dev/null
+}
+
 [ -d "$SRC_XCF" ] || error "Source xcframework missing: $SRC_XCF"
 [ -d "$SRC_XCF/ios-arm64/CLiteRTLM.framework" ] || error "Missing device slice"
 [ -d "$SRC_XCF/ios-arm64-simulator/CLiteRTLM.framework" ] || error "Missing sim slice"
 
 DEVICE_SRC="$SRC_XCF/ios-arm64/CLiteRTLM.framework"
 SIM_SRC="$SRC_XCF/ios-arm64-simulator/CLiteRTLM.framework"
+
+# Source of the plugin dylibs. build-xcframework.sh produces a fat layout
+# where they live loosely inside CLiteRTLM.framework; re-runs of this script
+# find them in the already-split xcframeworks instead.
+GEMMA_DEVICE_DYLIB="$DEVICE_SRC/libGemmaModelConstraintProvider.dylib"
+if [ ! -f "$GEMMA_DEVICE_DYLIB" ]; then
+    GEMMA_DEVICE_DYLIB="$FRAMEWORKS_DIR/GemmaModelConstraintProvider.xcframework/ios-arm64/GemmaModelConstraintProvider.framework/GemmaModelConstraintProvider"
+fi
+METAL_DEVICE_DYLIB="$DEVICE_SRC/libLiteRtMetalAccelerator.dylib"
+if [ ! -f "$METAL_DEVICE_DYLIB" ]; then
+    METAL_DEVICE_DYLIB="$FRAMEWORKS_DIR/LiteRtMetalAccelerator.xcframework/ios-arm64/LiteRtMetalAccelerator.framework/LiteRtMetalAccelerator"
+fi
+METAL_SIM_DYLIB="$SIM_SRC/libLiteRtMetalAccelerator.dylib"
+if [ ! -f "$METAL_SIM_DYLIB" ]; then
+    METAL_SIM_DYLIB="$FRAMEWORKS_DIR/LiteRtMetalAccelerator.xcframework/ios-arm64-simulator/LiteRtMetalAccelerator.framework/LiteRtMetalAccelerator"
+fi
+[ -f "$GEMMA_DEVICE_DYLIB" ] || error "Gemma device dylib not found"
+[ -f "$METAL_DEVICE_DYLIB" ] || error "Metal device dylib not found"
+[ -f "$METAL_SIM_DYLIB" ]    || error "Metal sim dylib not found"
 
 # ---------------------------------------------------------------------------
 # 1. Clean CLiteRTLM.framework slices
@@ -119,12 +147,16 @@ make_gemma_slice() {
     install_name_tool -id \
         "@rpath/GemmaModelConstraintProvider.framework/GemmaModelConstraintProvider" \
         "$DEST/GemmaModelConstraintProvider"
+    case "$SLICE" in
+        ios-arm64)           set_ios_min "$DEST/GemmaModelConstraintProvider" ios ;;
+        ios-arm64-simulator) set_ios_min "$DEST/GemmaModelConstraintProvider" iossim ;;
+    esac
     write_plist "$DEST" "GemmaModelConstraintProvider" "com.google.GemmaModelConstraintProvider"
     codesign --force --sign - "$DEST/GemmaModelConstraintProvider"
     info "Built Gemma slice: $SLICE"
 }
 
-make_gemma_slice "ios-arm64" "$DEVICE_SRC/libGemmaModelConstraintProvider.dylib"
+make_gemma_slice "ios-arm64" "$GEMMA_DEVICE_DYLIB"
 
 GEMMA_STUB_SRC="$WORK_DIR/gemma_stub.c"
 GEMMA_STUB_DYLIB="$WORK_DIR/gemma_stub.dylib"
@@ -153,14 +185,25 @@ make_metal_slice() {
     local DEST="$WORK_DIR/metal/$SLICE/LiteRtMetalAccelerator.framework"
     mkdir -p "$DEST"
     cp "$SRC_DYLIB" "$DEST/LiteRtMetalAccelerator"
-    install_name_tool -id "libLiteRtMetalAccelerator.dylib" "$DEST/LiteRtMetalAccelerator"
+    # Standard @rpath install_name so the linker writes a resolvable
+    # LC_LOAD_DYLIB into consumers. The engine's runtime leaf-name dlopen
+    # still works because the dylib is already loaded at launch — its
+    # symbols are in the process namespace (engine's "Statically linked
+    # C API" fallback uses dlsym(RTLD_DEFAULT) and succeeds).
+    install_name_tool -id \
+        "@rpath/LiteRtMetalAccelerator.framework/LiteRtMetalAccelerator" \
+        "$DEST/LiteRtMetalAccelerator"
+    case "$SLICE" in
+        ios-arm64)           set_ios_min "$DEST/LiteRtMetalAccelerator" ios ;;
+        ios-arm64-simulator) set_ios_min "$DEST/LiteRtMetalAccelerator" iossim ;;
+    esac
     write_plist "$DEST" "LiteRtMetalAccelerator" "com.google.LiteRtMetalAccelerator"
     codesign --force --sign - "$DEST/LiteRtMetalAccelerator"
     info "Built Metal slice: $SLICE"
 }
 
-make_metal_slice "ios-arm64" "$DEVICE_SRC/libLiteRtMetalAccelerator.dylib"
-make_metal_slice "ios-arm64-simulator" "$SIM_SRC/libLiteRtMetalAccelerator.dylib"
+make_metal_slice "ios-arm64" "$METAL_DEVICE_DYLIB"
+make_metal_slice "ios-arm64-simulator" "$METAL_SIM_DYLIB"
 
 # ---------------------------------------------------------------------------
 # 4. Create the three xcframeworks
