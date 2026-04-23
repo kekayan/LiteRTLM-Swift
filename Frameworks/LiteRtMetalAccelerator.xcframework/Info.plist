@@ -6,7 +6,7 @@
 	<array>
 		<dict>
 			<key>BinaryPath</key>
-			<string>LiteRtMetalAccelerator.framework/libLiteRtMetalAccelerator.dylib</string>
+			<string>LiteRtMetalAccelerator.framework/LiteRtMetalAccelerator</string>
 			<key>LibraryIdentifier</key>
 			<string>ios-arm64</string>
 			<key>LibraryPath</key>
@@ -20,7 +20,7 @@
 		</dict>
 		<dict>
 			<key>BinaryPath</key>
-			<string>LiteRtMetalAccelerator.framework/libLiteRtMetalAccelerator.dylib</string>
+			<string>LiteRtMetalAccelerator.framework/LiteRtMetalAccelerator</string>
 			<key>LibraryIdentifier</key>
 			<string>ios-arm64-simulator</string>
 			<key>LibraryPath</key>

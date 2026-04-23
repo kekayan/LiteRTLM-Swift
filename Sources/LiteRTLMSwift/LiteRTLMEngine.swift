@@ -65,7 +65,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     // ensures Metal is still available when the engine tries to use it.
     private static let preloadPlugins: Void = {
         guard let frameworksPath = Bundle.main.privateFrameworksPath else { return }
-        let metalPath = "\(frameworksPath)/LiteRtMetalAccelerator.framework/libLiteRtMetalAccelerator.dylib"
+        let metalPath = "\(frameworksPath)/LiteRtMetalAccelerator.framework/LiteRtMetalAccelerator"
         guard FileManager.default.fileExists(atPath: metalPath) else {
             log.debug("Metal accelerator framework not present at \(metalPath, privacy: .public); GPU backend will fall back to CPU")
             return

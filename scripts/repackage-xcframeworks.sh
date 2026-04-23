@@ -191,24 +191,22 @@ make_gemma_slice "ios-arm64-simulator" "$GEMMA_STUB_DYLIB"
 make_metal_slice() {
     local SLICE="$1" SRC_DYLIB="$2"
     local DEST="$WORK_DIR/metal/$SLICE/LiteRtMetalAccelerator.framework"
-    local BIN_NAME="libLiteRtMetalAccelerator.dylib"
     mkdir -p "$DEST"
-    # The engine (gpu_registry.cc) calls dlopen("libLiteRtMetalAccelerator.dylib")
-    # with a bare leaf and rejects the GPU backend if that dlopen fails.
-    # dyld's leaf-name dlopen matches against the LEAF of each loaded image's
-    # install_name — so the binary inside the framework is named exactly that,
-    # CFBundleExecutable matches, and install_name's leaf matches. Then the
-    # engine's leaf-name dlopen cache-hits and GPU registration succeeds.
-    cp "$SRC_DYLIB" "$DEST/$BIN_NAME"
+    # Standard framework layout so `ld -framework LiteRtMetalAccelerator` works.
+    # The engine dlopens by the bare-leaf "libLiteRtMetalAccelerator.dylib"
+    # at runtime; consumers patch the embedded binary's install_name to that
+    # leaf after embed (see repo README / mei build phase) so dyld's cache
+    # lookup cache-hits on the leaf after the framework is loaded at launch.
+    cp "$SRC_DYLIB" "$DEST/LiteRtMetalAccelerator"
     install_name_tool -id \
-        "@rpath/LiteRtMetalAccelerator.framework/$BIN_NAME" \
-        "$DEST/$BIN_NAME"
+        "@rpath/LiteRtMetalAccelerator.framework/LiteRtMetalAccelerator" \
+        "$DEST/LiteRtMetalAccelerator"
     case "$SLICE" in
-        ios-arm64)           set_ios_min "$DEST/$BIN_NAME" ios ;;
-        ios-arm64-simulator) set_ios_min "$DEST/$BIN_NAME" iossim ;;
+        ios-arm64)           set_ios_min "$DEST/LiteRtMetalAccelerator" ios ;;
+        ios-arm64-simulator) set_ios_min "$DEST/LiteRtMetalAccelerator" iossim ;;
     esac
-    write_plist "$DEST" "LiteRtMetalAccelerator" "com.google.LiteRtMetalAccelerator" "$BIN_NAME"
-    codesign --force --sign - "$DEST/$BIN_NAME"
+    write_plist "$DEST" "LiteRtMetalAccelerator" "com.google.LiteRtMetalAccelerator"
+    codesign --force --sign - "$DEST/LiteRtMetalAccelerator"
     info "Built Metal slice: $SLICE"
 }
 
@@ -233,59 +231,10 @@ xcodebuild -create-xcframework \
     -framework "$WORK_DIR/gemma/ios-arm64-simulator/GemmaModelConstraintProvider.framework" \
     -output "$FRAMEWORKS_DIR/GemmaModelConstraintProvider.xcframework" >/dev/null
 
-# Manually assemble the Metal xcframework because `xcodebuild -create-xcframework`
-# expects the framework binary's filename to equal the framework name (without
-# .framework) — but our Metal framework is intentionally named
-# "libLiteRtMetalAccelerator.dylib" so that dyld's leaf-name dlopen match works.
-MOUT="$FRAMEWORKS_DIR/LiteRtMetalAccelerator.xcframework"
-mkdir -p "$MOUT/ios-arm64" "$MOUT/ios-arm64-simulator"
-cp -R "$WORK_DIR/metal/ios-arm64/LiteRtMetalAccelerator.framework" "$MOUT/ios-arm64/"
-cp -R "$WORK_DIR/metal/ios-arm64-simulator/LiteRtMetalAccelerator.framework" "$MOUT/ios-arm64-simulator/"
-cat > "$MOUT/Info.plist" << 'XFWK_PLIST'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-	<key>AvailableLibraries</key>
-	<array>
-		<dict>
-			<key>BinaryPath</key>
-			<string>LiteRtMetalAccelerator.framework/libLiteRtMetalAccelerator.dylib</string>
-			<key>LibraryIdentifier</key>
-			<string>ios-arm64</string>
-			<key>LibraryPath</key>
-			<string>LiteRtMetalAccelerator.framework</string>
-			<key>SupportedArchitectures</key>
-			<array>
-				<string>arm64</string>
-			</array>
-			<key>SupportedPlatform</key>
-			<string>ios</string>
-		</dict>
-		<dict>
-			<key>BinaryPath</key>
-			<string>LiteRtMetalAccelerator.framework/libLiteRtMetalAccelerator.dylib</string>
-			<key>LibraryIdentifier</key>
-			<string>ios-arm64-simulator</string>
-			<key>LibraryPath</key>
-			<string>LiteRtMetalAccelerator.framework</string>
-			<key>SupportedArchitectures</key>
-			<array>
-				<string>arm64</string>
-			</array>
-			<key>SupportedPlatform</key>
-			<string>ios</string>
-			<key>SupportedPlatformVariant</key>
-			<string>simulator</string>
-		</dict>
-	</array>
-	<key>CFBundlePackageType</key>
-	<string>XFWK</string>
-	<key>XCFrameworkFormatVersion</key>
-	<string>1.0</string>
-</dict>
-</plist>
-XFWK_PLIST
+xcodebuild -create-xcframework \
+    -framework "$WORK_DIR/metal/ios-arm64/LiteRtMetalAccelerator.framework" \
+    -framework "$WORK_DIR/metal/ios-arm64-simulator/LiteRtMetalAccelerator.framework" \
+    -output "$FRAMEWORKS_DIR/LiteRtMetalAccelerator.xcframework" >/dev/null
 
 info "Wrote:"
 info "  $FRAMEWORKS_DIR/LiteRTLM.xcframework"
