@@ -286,12 +286,16 @@ info "Packaging simulator framework..."
 package_framework "ios-arm64-simulator" "$SIM_DYLIB" "" "$METAL_SIM"
 
 # ---------------------------------------------------------------------------
-# 6. Create xcframework
+# 6. Create intermediate fat xcframework, then repackage
 # ---------------------------------------------------------------------------
+# The fat xcframework (with loose dylibs inside CLiteRTLM.framework) is
+# rejected by App Store Connect (ITMS-90171). We produce it as an intermediate,
+# then run repackage-xcframeworks.sh to split the loose dylibs into sibling
+# xcframeworks (LiteRtMetalAccelerator, GemmaModelConstraintProvider) and fix
+# CLiteRTLM's Info.plist + load commands.
 
-info "Creating xcframework..."
+info "Creating intermediate xcframework..."
 
-# Remove existing
 rm -rf "$OUTPUT_DIR"
 
 xcodebuild -create-xcframework \
@@ -299,25 +303,20 @@ xcodebuild -create-xcframework \
     -framework "$WORK_DIR/ios-arm64-simulator/$FRAMEWORK_NAME.framework" \
     -output "$OUTPUT_DIR"
 
-info "XCFramework created at: $OUTPUT_DIR"
+info "Repackaging into App-Store-compliant xcframeworks..."
+"$SCRIPT_DIR/repackage-xcframeworks.sh"
 
 # ---------------------------------------------------------------------------
 # 7. Verify
 # ---------------------------------------------------------------------------
 
-info "Verifying xcframework..."
+info "Verifying xcframeworks..."
 
-for ARCH_DIR in "$OUTPUT_DIR"/ios-*/; do
-    BINARY="$ARCH_DIR$FRAMEWORK_NAME.framework/$FRAMEWORK_NAME"
-    if [ -f "$BINARY" ]; then
-        ARCH_INFO=$(file "$BINARY" | grep -oE 'arm64|x86_64' | head -1)
-        SIZE=$(du -h "$BINARY" | cut -f1)
-        info "  $(basename "$ARCH_DIR"): $ARCH_INFO ($SIZE)"
-    fi
+for XCF in LiteRTLM GemmaModelConstraintProvider LiteRtMetalAccelerator; do
+    XCF_PATH="$PROJECT_DIR/Frameworks/$XCF.xcframework"
+    [ -d "$XCF_PATH" ] || error "Missing $XCF_PATH"
+    info "  $XCF.xcframework: $(du -sh "$XCF_PATH" | cut -f1)"
 done
 
-TOTAL_SIZE=$(du -sh "$OUTPUT_DIR" | cut -f1)
-info "Total xcframework size: $TOTAL_SIZE"
-
-info "Done! xcframework is ready at Frameworks/LiteRTLM.xcframework"
+info "Done! Three xcframeworks ready under Frameworks/"
 # WORK_DIR is cleaned up automatically by the EXIT trap

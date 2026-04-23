@@ -58,6 +58,23 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 
     private static let log = Logger(subsystem: "LiteRTLMSwift", category: "Engine")
 
+    // The C++ engine dlopen's "libLiteRtMetalAccelerator.dylib" by leaf name.
+    // We load the sibling framework's binary by full path so dyld caches it
+    // under its install_name (set to that bare leaf during packaging); the
+    // engine's later leaf-name dlopen then hits that cache.
+    private static let preloadPlugins: Void = {
+        guard let frameworksPath = Bundle.main.privateFrameworksPath else { return }
+        let metalPath = "\(frameworksPath)/LiteRtMetalAccelerator.framework/LiteRtMetalAccelerator"
+        guard FileManager.default.fileExists(atPath: metalPath) else {
+            log.debug("Metal accelerator framework not present at \(metalPath, privacy: .public); GPU backend will fall back to CPU")
+            return
+        }
+        if dlopen(metalPath, RTLD_NOW | RTLD_GLOBAL) == nil {
+            let err = dlerror().map { String(cString: $0) } ?? "unknown"
+            log.error("dlopen LiteRtMetalAccelerator failed: \(err, privacy: .public)")
+        }
+    }()
+
     // MARK: - Init
 
     /// Create an engine instance.
@@ -109,6 +126,8 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     @MainActor
     public func load() async throws {
         guard status != .ready && status != .loading else { return }
+
+        _ = Self.preloadPlugins
 
         status = .loading
 
