@@ -817,6 +817,56 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         return try await sendRawMessage(messageJSON: messageJSON)
     }
 
+    /// Multimodal counterpart to `conversationSendRaw`. Sends images and/or
+    /// audio alongside the text prompt within an open tool-call conversation
+    /// and returns the raw JSON reply so callers can inspect `tool_calls`.
+    /// Mirrors `conversationSend(audioData:imagesData:prompt:)` but routes
+    /// through `sendRawMessage` instead of swallowing the response.
+    public func conversationSendMultimodalRaw(
+        imagesData: [Data] = [],
+        audioData: [Data] = [],
+        audioFormat: AudioFormat = .wav,
+        prompt: String,
+        maxImageDimension: Int = 1024
+    ) async throws -> String {
+        try ensureReady()
+
+        var tempURLs: [URL] = []
+        var audioPaths: [String] = []
+        var imagePaths: [String] = []
+
+        do {
+            for (i, data) in audioData.enumerated() {
+                guard !data.isEmpty else {
+                    throw LiteRTLMError.inferenceFailure("Audio data \(i + 1) is empty")
+                }
+                let url = Self.makeTempURL(extension: audioFormat.rawValue)
+                try data.write(to: url)
+                tempURLs.append(url)
+                audioPaths.append(url.path)
+            }
+            for (i, data) in imagesData.enumerated() {
+                guard let jpegData = Self.prepareImageForVision(data, maxDimension: maxImageDimension) else {
+                    throw LiteRTLMError.inferenceFailure("Failed to convert image \(i + 1) to JPEG")
+                }
+                let url = Self.makeTempURL(extension: "jpg")
+                try jpegData.write(to: url)
+                tempURLs.append(url)
+                imagePaths.append(url.path)
+            }
+        } catch {
+            Self.cleanupTempFiles(tempURLs)
+            throw error
+        }
+
+        let messageJSON = Self.buildMultimodalMessageJSON(
+            audioPaths: audioPaths, imagePaths: imagePaths, text: prompt
+        )
+
+        defer { Self.cleanupTempFiles(tempURLs) }
+        return try await sendRawMessage(messageJSON: messageJSON)
+    }
+
     /// A prior turn replayed into the conversation KV cache on the first
     /// send of a reopened session. The C API accepts a JSON array of
     /// messages, so we prepend these as real `role: user` / `role:
