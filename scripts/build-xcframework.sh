@@ -115,6 +115,7 @@ $LOGGING_SRCS
     ],
     linkopts = [
         "-Wl,-exported_symbol,_litert_lm_*",
+        "-Wl,-exported_symbol,_LiteRt*",
     ],
     linkshared = True,
     linkstatic = True,
