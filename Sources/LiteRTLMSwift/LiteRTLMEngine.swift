@@ -207,8 +207,26 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     @MainActor
     public func unload() {
         inferenceQueue.sync {
-            closeSessionLocked(log: false)
-            closeConversationLocked(log: false)
+            if let s = chatSession {
+                litert_lm_session_delete(s)
+                chatSession = nil
+            }
+            if let c = chatSessionConfig {
+                litert_lm_session_config_delete(c)
+                chatSessionConfig = nil
+            }
+            if let c = multimodalConversation {
+                litert_lm_conversation_delete(c)
+                multimodalConversation = nil
+            }
+            if let c = multimodalConvConfig {
+                litert_lm_conversation_config_delete(c)
+                multimodalConvConfig = nil
+            }
+            if let c = multimodalSessionConfig {
+                litert_lm_session_config_delete(c)
+                multimodalSessionConfig = nil
+            }
             if let eng = engine { litert_lm_engine_delete(eng) }
             engine = nil
         }
@@ -482,7 +500,14 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             inferenceQueue.async { [self] in
                 do {
-                    closeSessionLocked(log: false)
+                    if let s = chatSession {
+                        litert_lm_session_delete(s)
+                        chatSession = nil
+                    }
+                    if let c = chatSessionConfig {
+                        litert_lm_session_config_delete(c)
+                        chatSessionConfig = nil
+                    }
 
                     guard let eng = engine else { throw LiteRTLMError.modelNotLoaded }
                     let (session, config) = try createSession(
@@ -501,23 +526,17 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 
     /// Close the persistent session, freeing KV cache memory.
     public func closeSession() {
-        inferenceQueue.sync { [self] in
-            closeSessionLocked()
-        }
-    }
-
-    private func closeSessionLocked(log shouldLog: Bool = true) {
-        guard chatSession != nil || chatSessionConfig != nil else { return }
-        if let s = chatSession {
-            if shouldLog { logSessionBenchmark(s) }
-            litert_lm_session_delete(s)
-            chatSession = nil
-        }
-        if let c = chatSessionConfig {
-            litert_lm_session_config_delete(c)
-            chatSessionConfig = nil
-        }
-        if shouldLog {
+        inferenceQueue.async { [self] in
+            guard chatSession != nil else { return }
+            if let s = chatSession {
+                logSessionBenchmark(s)
+                litert_lm_session_delete(s)
+                chatSession = nil
+            }
+            if let c = chatSessionConfig {
+                litert_lm_session_config_delete(c)
+                chatSessionConfig = nil
+            }
             Self.log.info("Persistent session closed")
         }
     }
@@ -552,8 +571,20 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             inferenceQueue.async { [self] in
                 do {
-                    // Close existing conversation if any.
-                    closeConversationLocked(log: false)
+                    // Close existing conversation if any
+                    if let c = multimodalConversation {
+                        litert_lm_conversation_delete(c)
+                        multimodalConversation = nil
+                    }
+                    if let c = multimodalConvConfig {
+                        litert_lm_conversation_config_delete(c)
+                        multimodalConvConfig = nil
+                    }
+                    if let c = multimodalSessionConfig {
+                        litert_lm_session_config_delete(c)
+                        multimodalSessionConfig = nil
+                    }
+                    conversationThinkingEnabled = false
 
                     guard let eng = engine else { throw LiteRTLMError.modelNotLoaded }
 
@@ -706,7 +737,18 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             inferenceQueue.async { [self] in
                 do {
-                    closeConversationLocked(log: false)
+                    if let c = multimodalConversation {
+                        litert_lm_conversation_delete(c)
+                        multimodalConversation = nil
+                    }
+                    if let c = multimodalConvConfig {
+                        litert_lm_conversation_config_delete(c)
+                        multimodalConvConfig = nil
+                    }
+                    if let c = multimodalSessionConfig {
+                        litert_lm_session_config_delete(c)
+                        multimodalSessionConfig = nil
+                    }
                     conversationThinkingEnabled = enableThinking
 
                     guard let eng = engine else { throw LiteRTLMError.modelNotLoaded }
@@ -1280,7 +1322,6 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                                 }
 
                                 if isFinal || errorMessage != nil {
-                                    guard st.markFinished() else { return }
                                     if let error = errorMessage {
                                         st.continuation.finish(throwing: LiteRTLMError.inferenceFailure(error))
                                     } else {
@@ -1295,7 +1336,9 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                                         }
                                         st.continuation.finish()
                                     }
-                                    st.doneSemaphore.signal()
+                                    let semaphore = st.doneSemaphore
+                                    Unmanaged<ConversationStreamState>.fromOpaque(cbData).release()
+                                    semaphore.signal()
                                 }
                             },
                             statePtr
@@ -1310,7 +1353,6 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                 }
 
                 streamDone.wait()
-                Unmanaged<ConversationStreamState>.fromOpaque(statePtr).release()
             }
         }
     }
@@ -1364,34 +1406,21 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 
     /// Close the persistent multimodal conversation, freeing KV cache memory.
     public func closeConversation() {
-        inferenceQueue.sync { [self] in
-            closeConversationLocked()
-        }
-    }
-
-    private func closeConversationLocked(log shouldLog: Bool = true) {
-        guard multimodalConversation != nil
-            || multimodalConvConfig != nil
-            || multimodalSessionConfig != nil
-        else {
+        inferenceQueue.async { [self] in
+            guard multimodalConversation != nil else { return }
+            if let c = multimodalConversation {
+                litert_lm_conversation_delete(c)
+                multimodalConversation = nil
+            }
+            if let c = multimodalConvConfig {
+                litert_lm_conversation_config_delete(c)
+                multimodalConvConfig = nil
+            }
+            if let c = multimodalSessionConfig {
+                litert_lm_session_config_delete(c)
+                multimodalSessionConfig = nil
+            }
             conversationThinkingEnabled = false
-            return
-        }
-
-        if let c = multimodalConversation {
-            litert_lm_conversation_delete(c)
-            multimodalConversation = nil
-        }
-        if let c = multimodalConvConfig {
-            litert_lm_conversation_config_delete(c)
-            multimodalConvConfig = nil
-        }
-        if let c = multimodalSessionConfig {
-            litert_lm_session_config_delete(c)
-            multimodalSessionConfig = nil
-        }
-        conversationThinkingEnabled = false
-        if shouldLog {
             Self.log.info("Persistent multimodal conversation closed")
         }
     }
@@ -1440,13 +1469,14 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                             }
 
                             if isFinal || errorMessage != nil {
-                                guard st.markFinished() else { return }
                                 if let error = errorMessage {
                                     st.continuation.finish(throwing: LiteRTLMError.inferenceFailure(error))
                                 } else {
                                     st.continuation.finish()
                                 }
-                                st.doneSemaphore.signal()
+                                let semaphore = st.doneSemaphore
+                                Unmanaged<StreamCallbackState>.fromOpaque(cbData).release()
+                                semaphore.signal()
                             }
                         },
                         statePtr
@@ -1460,7 +1490,6 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                 }
 
                 streamDone.wait()
-                Unmanaged<StreamCallbackState>.fromOpaque(statePtr).release()
                 self.logSessionBenchmark(session)
             }
         }
@@ -1559,13 +1588,14 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                                 }
 
                                 if isFinal || errorMessage != nil {
-                                    guard st.markFinished() else { return }
                                     if let error = errorMessage {
                                         st.continuation.finish(throwing: LiteRTLMError.inferenceFailure(error))
                                     } else {
                                         st.continuation.finish()
                                     }
-                                    st.doneSemaphore.signal()
+                                    let semaphore = st.doneSemaphore
+                                    Unmanaged<StreamCallbackState>.fromOpaque(cbData).release()
+                                    semaphore.signal()
                                 }
                             },
                             statePtr
@@ -1581,7 +1611,6 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                     }
 
                     streamDone.wait()
-                    Unmanaged<StreamCallbackState>.fromOpaque(statePtr).release()
                     self.logSessionBenchmark(session)
                     litert_lm_session_delete(session)
                     litert_lm_session_config_delete(sessionConfig)
@@ -1840,21 +1869,11 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 private final class StreamCallbackState: @unchecked Sendable {
     let continuation: AsyncThrowingStream<String, Error>.Continuation
     let doneSemaphore: DispatchSemaphore
-    private let lock = NSLock()
-    private var didFinish = false
 
     init(continuation: AsyncThrowingStream<String, Error>.Continuation,
          doneSemaphore: DispatchSemaphore) {
         self.continuation = continuation
         self.doneSemaphore = doneSemaphore
-    }
-
-    func markFinished() -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        guard !didFinish else { return false }
-        didFinish = true
-        return true
     }
 }
 
@@ -1867,8 +1886,6 @@ private final class StreamCallbackState: @unchecked Sendable {
 private final class ConversationStreamState: @unchecked Sendable {
     let continuation: AsyncThrowingStream<LiteRTLMStreamEvent, Error>.Continuation
     let doneSemaphore: DispatchSemaphore
-    private let lock = NSLock()
-    private var didFinish = false
     var buffer: String = ""
     var yieldedToolCalls: Bool = false
 
@@ -1876,14 +1893,6 @@ private final class ConversationStreamState: @unchecked Sendable {
          doneSemaphore: DispatchSemaphore) {
         self.continuation = continuation
         self.doneSemaphore = doneSemaphore
-    }
-
-    func markFinished() -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        guard !didFinish else { return false }
-        didFinish = true
-        return true
     }
 }
 
