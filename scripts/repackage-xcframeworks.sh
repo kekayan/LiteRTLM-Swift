@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Repackage the fat LiteRTLM.xcframework into three App-Store-compliant
+# Repackage the fat LiteRTLM.xcframework into App-Store-compliant
 # xcframeworks:
 #
 #   1. LiteRTLM.xcframework                     — CLiteRTLM only (no loose dylibs)
@@ -8,6 +8,9 @@
 #                                                 constraint provider dylib
 #   3. LiteRtMetalAccelerator.xcframework       — sibling framework for the Metal
 #                                                 accelerator dylib (dlopen'd at
+#                                                 runtime by the engine)
+#   4. LiteRtTopKMetalSampler.xcframework       — sibling framework for the Metal
+#                                                 TopK sampler dylib (dlopen'd at
 #                                                 runtime by the engine)
 #
 # The fix addresses App Store Connect errors:
@@ -18,14 +21,14 @@
 #   - CLiteRTLM hard-links GemmaModelConstraintProvider via LC_LOAD_DYLIB.
 #     We rewrite it to @rpath/GemmaModelConstraintProvider.framework/<binary>
 #     and add LC_RPATH @loader_path/.. so dyld finds it at app's Frameworks/.
-#   - The Metal dylib is dlopen'd by leaf name. We set its install_name to the
-#     bare leaf "libLiteRtMetalAccelerator.dylib"; LiteRTLMSwift preemptively
-#     dlopens the framework by full path, after which dyld's install-name cache
-#     answers the engine's leaf-name dlopen.
+#   - The Metal plugin dylibs are dlopen'd by leaf name. LiteRTLMSwift
+#     preemptively dlopens the frameworks by full path; consumers then patch
+#     install_names after embed so dyld's install-name cache answers the
+#     engine's leaf-name dlopen.
 #
 # Input:  Frameworks/LiteRTLM.xcframework (as produced by build-xcframework.sh
 #         or its slice-builder mode, see --slices flag).
-# Output: Frameworks/{LiteRTLM,GemmaModelConstraintProvider,LiteRtMetalAccelerator}.xcframework
+# Output: Frameworks/{LiteRTLM,GemmaModelConstraintProvider,LiteRtMetalAccelerator,LiteRtTopKMetalSampler}.xcframework
 
 set -euo pipefail
 
@@ -79,13 +82,25 @@ find_existing_metal() {
         [ -f "$CAND" ] && { echo "$CAND"; return; }
     done
 }
+find_existing_topk() {
+    local SLICE="$1"
+    for CAND in \
+        "$FRAMEWORKS_DIR/LiteRtTopKMetalSampler.xcframework/$SLICE/LiteRtTopKMetalSampler.framework/libLiteRtTopKMetalSampler.dylib" \
+        "$FRAMEWORKS_DIR/LiteRtTopKMetalSampler.xcframework/$SLICE/LiteRtTopKMetalSampler.framework/LiteRtTopKMetalSampler"
+    do
+        [ -f "$CAND" ] && { echo "$CAND"; return; }
+    done
+}
 METAL_DEVICE_DYLIB="$DEVICE_SRC/libLiteRtMetalAccelerator.dylib"
 [ -f "$METAL_DEVICE_DYLIB" ] || METAL_DEVICE_DYLIB="$(find_existing_metal ios-arm64)"
 METAL_SIM_DYLIB="$SIM_SRC/libLiteRtMetalAccelerator.dylib"
 [ -f "$METAL_SIM_DYLIB" ] || METAL_SIM_DYLIB="$(find_existing_metal ios-arm64-simulator)"
+TOPK_DEVICE_DYLIB="$DEVICE_SRC/libLiteRtTopKMetalSampler.dylib"
+[ -f "$TOPK_DEVICE_DYLIB" ] || TOPK_DEVICE_DYLIB="$(find_existing_topk ios-arm64)"
 [ -f "$GEMMA_DEVICE_DYLIB" ] || error "Gemma device dylib not found"
 [ -f "$METAL_DEVICE_DYLIB" ] || error "Metal device dylib not found"
 [ -f "$METAL_SIM_DYLIB" ]    || error "Metal sim dylib not found"
+[ -f "$TOPK_DEVICE_DYLIB" ]  || error "TopK Metal sampler device dylib not found"
 
 # ---------------------------------------------------------------------------
 # 1. Clean CLiteRTLM.framework slices
@@ -129,6 +144,7 @@ clean_core_slice() {
     mkdir -p "$(dirname "$DEST")"
     cp -R "$SRC" "$DEST"
     rm -f "$DEST"/libLiteRtMetalAccelerator.dylib \
+          "$DEST"/libLiteRtTopKMetalSampler.dylib \
           "$DEST"/libGemmaModelConstraintProvider.dylib
     rm -rf "$DEST/_CodeSignature"
     write_plist "$DEST" "CLiteRTLM" "com.google.CLiteRTLM"
@@ -223,12 +239,56 @@ make_metal_slice "ios-arm64" "$METAL_DEVICE_DYLIB"
 make_metal_slice "ios-arm64-simulator" "$METAL_SIM_DYLIB"
 
 # ---------------------------------------------------------------------------
-# 4. Create the three xcframeworks
+# 4. Build LiteRtTopKMetalSampler.framework
+# ---------------------------------------------------------------------------
+#   Device: real upstream prebuilt from LiteRT-LM prebuilt/ios_arm64.
+#   Sim:    empty clang stub. Upstream does not currently ship an iOS simulator
+#           TopK Metal sampler, and the stub exists only so SPM can resolve the
+#           binary target for simulator builds.
+
+make_topk_slice() {
+    local SLICE="$1" SRC_DYLIB="$2"
+    local DEST="$WORK_DIR/topk/$SLICE/LiteRtTopKMetalSampler.framework"
+    mkdir -p "$DEST"
+    cp "$SRC_DYLIB" "$DEST/LiteRtTopKMetalSampler"
+    install_name_tool -id \
+        "@rpath/LiteRtTopKMetalSampler.framework/LiteRtTopKMetalSampler" \
+        "$DEST/LiteRtTopKMetalSampler"
+    case "$SLICE" in
+        ios-arm64)           set_ios_min "$DEST/LiteRtTopKMetalSampler" ios ;;
+        ios-arm64-simulator) set_ios_min "$DEST/LiteRtTopKMetalSampler" iossim ;;
+    esac
+    write_plist "$DEST" "LiteRtTopKMetalSampler" "com.google.LiteRtTopKMetalSampler"
+    codesign --force --sign - "$DEST/LiteRtTopKMetalSampler"
+    info "Built TopK Metal sampler slice: $SLICE"
+}
+
+make_topk_slice "ios-arm64" "$TOPK_DEVICE_DYLIB"
+
+TOPK_STUB_SRC="$WORK_DIR/topk_stub.c"
+TOPK_STUB_DYLIB="$WORK_DIR/topk_stub.dylib"
+cat > "$TOPK_STUB_SRC" << 'EOF'
+/* Simulator-only stub. Upstream currently ships only an iOS device
+   libLiteRtTopKMetalSampler.dylib. */
+void* LiteRtTopKMetalSampler_Create(void) { return 0; }
+void LiteRtTopKMetalSampler_Destroy(void* sampler) { (void)sampler; }
+int LiteRtTopKMetalSampler_SampleToIdAndScoreBuffer(void) { return -1; }
+EOF
+xcrun --sdk iphonesimulator clang \
+    -target arm64-apple-ios17-simulator \
+    -dynamiclib \
+    -install_name "@rpath/LiteRtTopKMetalSampler.framework/LiteRtTopKMetalSampler" \
+    "$TOPK_STUB_SRC" -o "$TOPK_STUB_DYLIB"
+make_topk_slice "ios-arm64-simulator" "$TOPK_STUB_DYLIB"
+
+# ---------------------------------------------------------------------------
+# 5. Create the four xcframeworks
 # ---------------------------------------------------------------------------
 
 rm -rf "$FRAMEWORKS_DIR/LiteRTLM.xcframework" \
        "$FRAMEWORKS_DIR/GemmaModelConstraintProvider.xcframework" \
-       "$FRAMEWORKS_DIR/LiteRtMetalAccelerator.xcframework"
+       "$FRAMEWORKS_DIR/LiteRtMetalAccelerator.xcframework" \
+       "$FRAMEWORKS_DIR/LiteRtTopKMetalSampler.xcframework"
 
 xcodebuild -create-xcframework \
     -framework "$WORK_DIR/core/ios-arm64/CLiteRTLM.framework" \
@@ -245,7 +305,13 @@ xcodebuild -create-xcframework \
     -framework "$WORK_DIR/metal/ios-arm64-simulator/LiteRtMetalAccelerator.framework" \
     -output "$FRAMEWORKS_DIR/LiteRtMetalAccelerator.xcframework" >/dev/null
 
+xcodebuild -create-xcframework \
+    -framework "$WORK_DIR/topk/ios-arm64/LiteRtTopKMetalSampler.framework" \
+    -framework "$WORK_DIR/topk/ios-arm64-simulator/LiteRtTopKMetalSampler.framework" \
+    -output "$FRAMEWORKS_DIR/LiteRtTopKMetalSampler.xcframework" >/dev/null
+
 info "Wrote:"
 info "  $FRAMEWORKS_DIR/LiteRTLM.xcframework"
 info "  $FRAMEWORKS_DIR/GemmaModelConstraintProvider.xcframework"
 info "  $FRAMEWORKS_DIR/LiteRtMetalAccelerator.xcframework"
+info "  $FRAMEWORKS_DIR/LiteRtTopKMetalSampler.xcframework"

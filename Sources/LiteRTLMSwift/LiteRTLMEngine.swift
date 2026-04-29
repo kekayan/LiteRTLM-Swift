@@ -65,21 +65,28 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 
     private static let log = Logger(subsystem: "LiteRTLMSwift", category: "Engine")
 
-    // Belt-and-braces Metal preload. The framework auto-loads at launch via
-    // LC_LOAD_DYLIB so its symbols are in the process namespace; this dlopen
-    // is a no-op in that case. It only matters if a consumer ever configures
-    // the framework as "embed without link" (no LC_LOAD_DYLIB) — then this
-    // ensures Metal is still available when the engine tries to use it.
+    // Belt-and-braces Metal plugin preload. The frameworks auto-load at launch
+    // via LC_LOAD_DYLIB so their symbols are in the process namespace; these
+    // dlopen calls are no-ops in that case. They matter if a consumer ever
+    // configures a framework as "embed without link" (no LC_LOAD_DYLIB).
     private static let preloadPlugins: Void = {
         guard let frameworksPath = Bundle.main.privateFrameworksPath else { return }
-        let metalPath = "\(frameworksPath)/LiteRtMetalAccelerator.framework/LiteRtMetalAccelerator"
-        guard FileManager.default.fileExists(atPath: metalPath) else {
-            log.debug("Metal accelerator framework not present at \(metalPath, privacy: .public); GPU backend will fall back to CPU")
-            return
-        }
-        if dlopen(metalPath, RTLD_NOW | RTLD_GLOBAL) == nil {
-            let err = dlerror().map { String(cString: $0) } ?? "unknown"
-            log.error("dlopen LiteRtMetalAccelerator failed: \(err, privacy: .public)")
+
+        let plugins = [
+            ("LiteRtMetalAccelerator", "LiteRtMetalAccelerator"),
+            ("LiteRtTopKMetalSampler", "LiteRtTopKMetalSampler"),
+        ]
+
+        for (frameworkName, executableName) in plugins {
+            let pluginPath = "\(frameworksPath)/\(frameworkName).framework/\(executableName)"
+            guard FileManager.default.fileExists(atPath: pluginPath) else {
+                log.debug("\(frameworkName, privacy: .public) framework not present at \(pluginPath, privacy: .public); related GPU features may fall back")
+                continue
+            }
+            if dlopen(pluginPath, RTLD_NOW | RTLD_GLOBAL) == nil {
+                let err = dlerror().map { String(cString: $0) } ?? "unknown"
+                log.error("dlopen \(frameworkName, privacy: .public) failed: \(err, privacy: .public)")
+            }
         }
     }()
 

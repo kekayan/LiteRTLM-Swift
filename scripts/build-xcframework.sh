@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Build CLiteRTLM.xcframework from Google's LiteRT-LM source.
+# Build LiteRTLM Swift binary frameworks from Google's LiteRT-LM source.
 #
 # Prerequisites:
 #   - Bazel 7.6.1 (install via Bazelisk: brew install bazelisk)
@@ -9,6 +9,10 @@
 #
 # Usage:
 #   ./scripts/build-xcframework.sh [/path/to/LiteRT-LM]
+#
+# Optional environment:
+#   LITERT_LM_REF=<git ref>       Checkout this upstream ref when cloning.
+#   LITERT_PREBUILTS_URL=<url>    Override LiteRT accelerator prebuilts zip.
 #
 # If no path is provided, clones the repo to a temp directory.
 
@@ -39,7 +43,13 @@ LITERT_LM_DIR="${1:-}"
 if [ -z "$LITERT_LM_DIR" ]; then
     LITERT_LM_DIR="$WORK_DIR/LiteRT-LM"
     info "Cloning LiteRT-LM source..."
-    git clone --depth 1 https://github.com/google-ai-edge/LiteRT-LM.git "$LITERT_LM_DIR"
+    if [ -n "${LITERT_LM_REF:-}" ]; then
+        git clone --filter=blob:none --no-checkout https://github.com/google-ai-edge/LiteRT-LM.git "$LITERT_LM_DIR"
+        git -C "$LITERT_LM_DIR" fetch --depth 1 origin "$LITERT_LM_REF"
+        git -C "$LITERT_LM_DIR" checkout --detach FETCH_HEAD
+    else
+        git clone --depth 1 https://github.com/google-ai-edge/LiteRT-LM.git "$LITERT_LM_DIR"
+    fi
 fi
 
 if [ ! -f "$LITERT_LM_DIR/c/BUILD" ]; then
@@ -49,7 +59,19 @@ fi
 # Resolve to absolute path (relative paths break after `cd` into the source dir)
 LITERT_LM_DIR="$(cd "$LITERT_LM_DIR" && pwd)"
 
-info "Using LiteRT-LM source at: $LITERT_LM_DIR"
+UPSTREAM_REV="$(git -C "$LITERT_LM_DIR" rev-parse --short=12 HEAD 2>/dev/null || true)"
+info "Using LiteRT-LM source at: $LITERT_LM_DIR${UPSTREAM_REV:+ ($UPSTREAM_REV)}"
+
+TOPK_CANDIDATE="$LITERT_LM_DIR/prebuilt/ios_arm64/libLiteRtTopKMetalSampler.dylib"
+TOPK_DEVICE=""
+if [ -f "$TOPK_CANDIDATE" ] && file "$TOPK_CANDIDATE" | grep -q 'Mach-O'; then
+    TOPK_DEVICE="$TOPK_CANDIDATE"
+elif [ -f "$TOPK_CANDIDATE" ] && head -1 "$TOPK_CANDIDATE" | grep -q 'git-lfs'; then
+    error "TopK Metal sampler is a Git LFS pointer, not a dylib. Run: git -C \"$LITERT_LM_DIR\" lfs pull --include prebuilt/ios_arm64/libLiteRtTopKMetalSampler.dylib"
+else
+    error "TopK Metal sampler prebuilt not found at $TOPK_CANDIDATE"
+fi
+info "TopK Metal sampler device dylib: $(du -h "$TOPK_DEVICE" | cut -f1)"
 
 # ---------------------------------------------------------------------------
 # 1b. Patch upstream BUILD if needed
@@ -75,15 +97,21 @@ fi
 
 if ! grep -q 'libLiteRTLMEngine\.dylib' "$LITERT_LM_DIR/c/BUILD"; then
     info "Adding libLiteRTLMEngine.dylib target (not present in this version)..."
-    cat >> "$LITERT_LM_DIR/c/BUILD" << 'BUILD_PATCH'
+    # litert_lm_logging.cc/.h were removed in upstream main; include them only
+    # when present (needed for older pinned commits like 40dee845).
+    LOGGING_SRCS=""
+    if [ -f "$LITERT_LM_DIR/c/litert_lm_logging.cc" ]; then
+        LOGGING_SRCS='        "litert_lm_logging.cc",
+        "litert_lm_logging.h",'
+    fi
+    cat >> "$LITERT_LM_DIR/c/BUILD" << BUILD_PATCH
 
 cc_binary(
     name = "libLiteRTLMEngine.dylib",
     srcs = [
         "engine.cc",
         "engine.h",
-        "litert_lm_logging.cc",
-        "litert_lm_logging.h",
+$LOGGING_SRCS
     ],
     linkopts = [
         "-Wl,-exported_symbol,_litert_lm_*",
@@ -197,6 +225,16 @@ info "Metal device dylib: $(du -h "$METAL_DEVICE" | cut -f1)"
 info "Metal simulator dylib: $(du -h "$METAL_SIM" | cut -f1)"
 
 # ---------------------------------------------------------------------------
+# 4c. Locate optional LiteRT TopK Metal sampler prebuilt
+# ---------------------------------------------------------------------------
+# LiteRT-LM dynamically loads libLiteRtTopKMetalSampler.dylib for GPU sampling.
+# Upstream currently ships the iOS device dylib through Git LFS under prebuilt/.
+# There is no iOS simulator prebuilt, so the repackager creates a simulator
+# stub slice for SwiftPM resolution.
+
+info "Using TopK Metal sampler from: $TOPK_DEVICE"
+
+# ---------------------------------------------------------------------------
 # 5. Package as .framework bundles
 # ---------------------------------------------------------------------------
 
@@ -231,9 +269,9 @@ package_framework() {
         install_name_tool -id "@rpath/$FRAMEWORK_NAME.framework/$BASENAME" "$FW_DIR/$BASENAME" || true
     done
 
-    # Copy headers
+    # Copy headers (litert_lm_logging.h absent in upstream main)
     cp "$HEADERS_DIR/engine.h" "$FW_DIR/Headers/"
-    cp "$HEADERS_DIR/litert_lm_logging.h" "$FW_DIR/Headers/"
+    [ -f "$HEADERS_DIR/litert_lm_logging.h" ] && cp "$HEADERS_DIR/litert_lm_logging.h" "$FW_DIR/Headers/"
 
     # Create module map
     cat > "$FW_DIR/Modules/module.modulemap" << 'MODULEMAP'
@@ -280,7 +318,7 @@ PLIST
 }
 
 info "Packaging device framework..."
-package_framework "ios-arm64" "$DEVICE_DYLIB" "$CONSTRAINT_DYLIB" "$METAL_DEVICE"
+package_framework "ios-arm64" "$DEVICE_DYLIB" "$CONSTRAINT_DYLIB" "$METAL_DEVICE" "$TOPK_DEVICE"
 
 info "Packaging simulator framework..."
 package_framework "ios-arm64-simulator" "$SIM_DYLIB" "" "$METAL_SIM"
@@ -312,7 +350,7 @@ info "Repackaging into App-Store-compliant xcframeworks..."
 
 info "Verifying xcframeworks..."
 
-for XCF in LiteRTLM GemmaModelConstraintProvider LiteRtMetalAccelerator; do
+for XCF in LiteRTLM GemmaModelConstraintProvider LiteRtMetalAccelerator LiteRtTopKMetalSampler; do
     XCF_PATH="$PROJECT_DIR/Frameworks/$XCF.xcframework"
     [ -d "$XCF_PATH" ] || error "Missing $XCF_PATH"
     info "  $XCF.xcframework: $(du -sh "$XCF_PATH" | cut -f1)"

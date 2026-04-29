@@ -53,31 +53,38 @@ Or in Xcode: File > Add Package Dependencies > paste the repo URL > add `LiteRTL
 
 ### GPU backend: install_name patch
 
-If you pass `backend: "gpu"` to `LiteRTLMEngine`, add a **Run Script** build phase to your app target that runs after the frameworks are embedded. Without it, the engine's `dlopen("libLiteRtMetalAccelerator.dylib")` misses the already-loaded Metal plugin and the backend silently falls back to CPU (you'll see `gpu_registry.cc:187 GPU accelerator could not be loaded and registered` followed by `litert_lm_engine_create returned NULL`).
+If you pass `backend: "gpu"` to `LiteRTLMEngine`, add a **Run Script** build phase to your app target that runs after the frameworks are embedded. Without it, the engine's `dlopen("libLiteRtMetalAccelerator.dylib")` / `dlopen("libLiteRtTopKMetalSampler.dylib")` calls can miss the already-loaded Metal plugin frameworks and fall back to CPU paths.
 
-**Why it's needed:** `ld -framework LiteRtMetalAccelerator` requires the binary to be named `LiteRtMetalAccelerator` (not `libLiteRtMetalAccelerator.dylib`) inside the framework, so the shipped xcframework uses that name. But the LiteRT-LM engine dlopens plugins by the bare leaf `libLiteRtMetalAccelerator.dylib` — a name that, by default, never appears as any loaded image's install_name. Patching the embedded binary's install_name to the bare leaf post-embed fixes the mismatch without breaking link-time framework discovery.
+**Why it's needed:** `ld -framework ...` requires framework binaries to use framework-style names, so the shipped xcframeworks contain `LiteRtMetalAccelerator` and `LiteRtTopKMetalSampler`. But the LiteRT-LM engine dlopens plugins by bare dylib leaf names. Patching the embedded binaries' install names to those leaves post-embed fixes the mismatch without breaking link-time framework discovery.
 
 In the app target's **Build Phases** tab, add a new **Run Script Phase** after **Embed Frameworks** (declare the framework binary as an input so Xcode schedules it correctly):
 
 **Input File:**
 ```
 $(BUILT_PRODUCTS_DIR)/$(FRAMEWORKS_FOLDER_PATH)/LiteRtMetalAccelerator.framework/LiteRtMetalAccelerator
+$(BUILT_PRODUCTS_DIR)/$(FRAMEWORKS_FOLDER_PATH)/LiteRtTopKMetalSampler.framework/LiteRtTopKMetalSampler
 ```
 
 **Script:**
 ```sh
 set -e
-FW="$BUILT_PRODUCTS_DIR/$FRAMEWORKS_FOLDER_PATH/LiteRtMetalAccelerator.framework/LiteRtMetalAccelerator"
-[ -f "$FW" ] || exit 0
-DESIRED="libLiteRtMetalAccelerator.dylib"
-[ "$(otool -D "$FW" | tail -1)" = "$DESIRED" ] && exit 0
-install_name_tool -id "$DESIRED" "$FW"
-codesign --force --sign "${EXPANDED_CODE_SIGN_IDENTITY:--}" "$FW"
+patch_id() {
+  local fw="$1"
+  local desired="$2"
+  [ -f "$fw" ] || return 0
+  [ "$(otool -D "$fw" | tail -1)" = "$desired" ] || install_name_tool -id "$desired" "$fw"
+  codesign --force --sign "${EXPANDED_CODE_SIGN_IDENTITY:--}" "$fw"
+}
+
+patch_id "$BUILT_PRODUCTS_DIR/$FRAMEWORKS_FOLDER_PATH/LiteRtMetalAccelerator.framework/LiteRtMetalAccelerator" \
+  "libLiteRtMetalAccelerator.dylib"
+patch_id "$BUILT_PRODUCTS_DIR/$FRAMEWORKS_FOLDER_PATH/LiteRtTopKMetalSampler.framework/LiteRtTopKMetalSampler" \
+  "libLiteRtTopKMetalSampler.dylib"
 ```
 
 Tick **"Based on dependency analysis"** off (or set `alwaysOutOfDate = 1` in the pbxproj) so the phase always runs — the patch must survive an unpatched fresh embed after a clean build.
 
-At launch, dyld resolves the app's pre-patch `LC_LOAD_DYLIB @rpath/LiteRtMetalAccelerator.framework/LiteRtMetalAccelerator` via rpath, loads the file, and indexes the loaded image under the new `LC_ID_DYLIB libLiteRtMetalAccelerator.dylib`. When the engine later calls `dlopen("libLiteRtMetalAccelerator.dylib")`, dyld's install-name cache answers with the existing handle and the plugin registers. You should see `Statically linked GPU accelerator registered.` (or `Dynamically loaded GPU accelerator(libLiteRtMetalAccelerator.dylib) registered.`) in the console instead of the fallback warning.
+At launch, dyld resolves the app's pre-patch `LC_LOAD_DYLIB @rpath/...framework/...` entries via rpath, loads the files, and indexes each loaded image under the patched `LC_ID_DYLIB` leaf. When the engine later calls `dlopen("libLiteRtMetalAccelerator.dylib")` or `dlopen("libLiteRtTopKMetalSampler.dylib")`, dyld's install-name cache can answer with the existing handle.
 
 If you only ever use `backend: "cpu"` (the default), you don't need this phase.
 
@@ -482,13 +489,14 @@ Tell me more.
 
 ## Building the XCFramework from Source
 
-This repo ships a prebuilt `CLiteRTLM.xcframework`. If you want to build it yourself (e.g. to pick up upstream fixes or try the GPU backend), follow the steps below.
+This repo ships prebuilt xcframeworks under `Frameworks/`. If you want to rebuild them yourself (e.g. to pick up upstream fixes or try a newer GPU backend), follow the steps below.
 
 ### Prerequisites
 
 | Tool | Version | Install |
 |------|---------|---------|
 | Bazel | 7.6.1 | `brew install bazelisk` (auto-downloads correct version) |
+| Git LFS | Latest | `brew install git-lfs` |
 | Xcode | 16+ | Mac App Store |
 | Disk space | ~20 GB | Bazel build cache |
 
@@ -498,6 +506,9 @@ This repo ships a prebuilt `CLiteRTLM.xcframework`. If you want to build it your
 # Clones LiteRT-LM source automatically and builds xcframework
 ./scripts/build-xcframework.sh
 
+# Build a specific upstream ref
+LITERT_LM_REF=40dee845d53708406179e6d5da9177faf259176e ./scripts/build-xcframework.sh
+
 # Or point to an existing local checkout
 ./scripts/build-xcframework.sh ~/Dev/LiteRT-LM
 ```
@@ -506,7 +517,11 @@ The script will:
 1. Clone (or use existing) [google-ai-edge/LiteRT-LM](https://github.com/google-ai-edge/LiteRT-LM) source
 2. Patch `c/BUILD` if needed — adds the `cc_binary` dylib target (missing in v0.10.2 and earlier) and stubs `ios_engine.bzl` (missing in HEAD)
 3. Build `libLiteRTLMEngine.dylib` for `ios_arm64` (device) and `ios_sim_arm64` (simulator)
-4. Package both into `Frameworks/LiteRTLM.xcframework`
+4. Download the LiteRT Metal accelerator prebuilt zip
+5. Wrap the upstream Git LFS `prebuilt/ios_arm64/libLiteRtTopKMetalSampler.dylib` when present
+6. Package App-Store-compliant sibling xcframeworks under `Frameworks/`
+
+You can also run the **Build XCFrameworks** GitHub Action manually. It checks out the requested upstream LiteRT-LM ref, pulls the TopK sampler LFS object, runs the same build script, verifies the package manifest, and uploads the generated xcframeworks as an artifact.
 
 ### Option B: Manual Step-by-Step
 

@@ -22,12 +22,17 @@ let package = Package(
             name: "LiteRtMetalAccelerator",
             path: "Frameworks/LiteRtMetalAccelerator.xcframework"
         ),
+        .binaryTarget(
+            name: "LiteRtTopKMetalSampler",
+            path: "Frameworks/LiteRtTopKMetalSampler.xcframework"
+        ),
         .target(
             name: "LiteRTLMSwift",
             dependencies: [
                 "CLiteRTLM",
                 "GemmaModelConstraintProvider",
                 "LiteRtMetalAccelerator",
+                "LiteRtTopKMetalSampler",
             ],
             path: "Sources/LiteRTLMSwift"
         ),
