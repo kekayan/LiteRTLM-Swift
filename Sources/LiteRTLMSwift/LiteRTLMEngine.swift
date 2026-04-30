@@ -138,8 +138,16 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 
     /// Load the `.litertlm` model. Call once, reuse for multiple inferences.
     /// Vision and audio encoders are embedded in the model file — no separate load step needed.
+    ///
+    /// `maxNumTokens` sizes the engine's KV cache (total context window:
+    /// system + tools + history + prompt + decode). The runtime substitutes
+    /// this value into the model's magic-number tensor shapes, so it must
+    /// be set at load time and cannot grow afterwards. Defaults to 4096;
+    /// callers should pass the model's declared context window (e.g.
+    /// Gemma 4 E2B-it: 32K) clamped to whatever the device can hold —
+    /// every doubling roughly doubles KV cache memory.
     @MainActor
-    public func load() async throws {
+    public func load(maxNumTokens: Int32 = 4096) async throws {
         guard status != .ready && status != .loading else { return }
 
         _ = Self.preloadPlugins
@@ -175,7 +183,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                             throw LiteRTLMError.engineCreationFailed("Failed to create engine settings")
                         }
 
-                        litert_lm_engine_settings_set_max_num_tokens(settings, 4096)
+                        litert_lm_engine_settings_set_max_num_tokens(settings, maxNumTokens)
 
                         let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
                             .appendingPathComponent("litertlm_cache").path
