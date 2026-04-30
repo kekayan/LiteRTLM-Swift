@@ -273,8 +273,12 @@ make_topk_slice() {
     local DEST="$WORK_DIR/topk/$SLICE/LiteRtTopKMetalSampler.framework"
     mkdir -p "$DEST"
     cp "$SRC_DYLIB" "$DEST/LiteRtTopKMetalSampler"
+    # The engine calls dlopen("libLiteRtTopKMetalSampler.dylib") by bare leaf name.
+    # Setting the install name to that leaf means dyld registers the library under
+    # this name at launch (loaded via LC_LOAD_DYLIB from the app binary), so the
+    # engine's bare-name dlopen finds it already loaded.
     install_name_tool -id \
-        "@rpath/LiteRtTopKMetalSampler.framework/LiteRtTopKMetalSampler" \
+        "libLiteRtTopKMetalSampler.dylib" \
         "$DEST/LiteRtTopKMetalSampler"
     case "$SLICE" in
         ios-arm64)           set_ios_min "$DEST/LiteRtTopKMetalSampler" ios ;;
