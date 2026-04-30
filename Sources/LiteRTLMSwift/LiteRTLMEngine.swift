@@ -184,11 +184,20 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 
                         litert_lm_engine_settings_enable_benchmark(settings)
 
-                        guard let createdEngine = litert_lm_engine_create(settings) else {
-                            litert_lm_engine_settings_delete(settings)
+                        // litert_lm_engine_create compiles and loads the model
+                        // in-place and needs more than GCD's default 512KB stack.
+                        // Spin a dedicated thread with 8MB stack; block until done.
+                        let engineSem = DispatchSemaphore(value: 0)
+                        var rawEngine: OpaquePointer? = nil
+                        let t = Thread { rawEngine = litert_lm_engine_create(settings); engineSem.signal() }
+                        t.stackSize = 8 * 1024 * 1024
+                        t.start()
+                        engineSem.wait()
+                        litert_lm_engine_settings_delete(settings)
+
+                        guard let createdEngine = rawEngine else {
                             throw LiteRTLMError.engineCreationFailed("litert_lm_engine_create returned NULL")
                         }
-                        litert_lm_engine_settings_delete(settings)
 
                         continuation.resume(returning: createdEngine)
                     } catch {
