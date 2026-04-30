@@ -12,6 +12,10 @@
 #   4. LiteRtTopKMetalSampler.xcframework       — sibling framework for the Metal
 #                                                 TopK sampler dylib (dlopen'd at
 #                                                 runtime by the engine)
+#   5. LiteRt.xcframework                       — libLiteRt.dylib providing _LiteRt*
+#                                                 symbols in the flat namespace so
+#                                                 the Metal accelerator can resolve
+#                                                 them at dlopen time
 #
 # The fix addresses App Store Connect errors:
 #   - ITMS-90171: loose .dylib files inside .framework are rejected
@@ -25,10 +29,14 @@
 #     preemptively dlopens the frameworks by full path; consumers then patch
 #     install_names after embed so dyld's install-name cache answers the
 #     engine's leaf-name dlopen.
+#   - LiteRtMetalAccelerator uses flat namespace to resolve _LiteRt* symbols.
+#     LiteRt.framework exports them; it must be embedded in the app.
 #
 # Input:  Frameworks/LiteRTLM.xcframework (as produced by build-xcframework.sh
 #         or its slice-builder mode, see --slices flag).
-# Output: Frameworks/{LiteRTLM,GemmaModelConstraintProvider,LiteRtMetalAccelerator,LiteRtTopKMetalSampler}.xcframework
+#         Optional env: LITERT_DEVICE_DYLIB, LITERT_SIM_DYLIB (paths to prebuilt
+#         libLiteRt.dylib slices; if unset, look in already-split xcframework).
+# Output: Frameworks/{LiteRTLM,GemmaModelConstraintProvider,LiteRtMetalAccelerator,LiteRtTopKMetalSampler,LiteRt}.xcframework
 
 set -euo pipefail
 
@@ -91,16 +99,31 @@ find_existing_topk() {
         [ -f "$CAND" ] && { echo "$CAND"; return; }
     done
 }
+find_existing_litert() {
+    local SLICE="$1"
+    for CAND in \
+        "$FRAMEWORKS_DIR/LiteRt.xcframework/$SLICE/LiteRt.framework/LiteRt"
+    do
+        [ -f "$CAND" ] && { echo "$CAND"; return; }
+    done
+}
 METAL_DEVICE_DYLIB="$DEVICE_SRC/libLiteRtMetalAccelerator.dylib"
 [ -f "$METAL_DEVICE_DYLIB" ] || METAL_DEVICE_DYLIB="$(find_existing_metal ios-arm64)"
 METAL_SIM_DYLIB="$SIM_SRC/libLiteRtMetalAccelerator.dylib"
 [ -f "$METAL_SIM_DYLIB" ] || METAL_SIM_DYLIB="$(find_existing_metal ios-arm64-simulator)"
 TOPK_DEVICE_DYLIB="$DEVICE_SRC/libLiteRtTopKMetalSampler.dylib"
 [ -f "$TOPK_DEVICE_DYLIB" ] || TOPK_DEVICE_DYLIB="$(find_existing_topk ios-arm64)"
+# LiteRt prebuilt: passed from build-xcframework.sh via env, or found in already-split xcframework
+LITERT_DEVICE_DYLIB="${LITERT_DEVICE_DYLIB:-}"
+LITERT_SIM_DYLIB="${LITERT_SIM_DYLIB:-}"
+[ -f "$LITERT_DEVICE_DYLIB" ] || LITERT_DEVICE_DYLIB="$(find_existing_litert ios-arm64)"
+[ -f "$LITERT_SIM_DYLIB" ]    || LITERT_SIM_DYLIB="$(find_existing_litert ios-arm64-simulator)"
 [ -f "$GEMMA_DEVICE_DYLIB" ] || error "Gemma device dylib not found"
 [ -f "$METAL_DEVICE_DYLIB" ] || error "Metal device dylib not found"
 [ -f "$METAL_SIM_DYLIB" ]    || error "Metal sim dylib not found"
 [ -f "$TOPK_DEVICE_DYLIB" ]  || error "TopK Metal sampler device dylib not found"
+[ -f "$LITERT_DEVICE_DYLIB" ] || error "LiteRt device dylib not found"
+[ -f "$LITERT_SIM_DYLIB" ]    || error "LiteRt sim dylib not found"
 
 # ---------------------------------------------------------------------------
 # 1. Clean CLiteRTLM.framework slices
@@ -281,13 +304,45 @@ xcrun --sdk iphonesimulator clang \
 make_topk_slice "ios-arm64-simulator" "$TOPK_STUB_DYLIB"
 
 # ---------------------------------------------------------------------------
-# 5. Create the four xcframeworks
+# 5. Build LiteRt.framework
+# ---------------------------------------------------------------------------
+#   Both slices from prebuilt libLiteRt.dylib (passed via LITERT_DEVICE_DYLIB /
+#   LITERT_SIM_DYLIB env vars set by build-xcframework.sh, or found in the
+#   already-split xcframework on re-runs).
+#
+#   LiteRtMetalAccelerator uses flat namespace to look up _LiteRt* symbols.
+#   This framework exports them so they're available in the process flat namespace
+#   at the point the Metal accelerator is dlopen'd.
+
+make_litert_slice() {
+    local SLICE="$1" SRC_DYLIB="$2"
+    local DEST="$WORK_DIR/litert/$SLICE/LiteRt.framework"
+    mkdir -p "$DEST"
+    cp "$SRC_DYLIB" "$DEST/LiteRt"
+    install_name_tool -id \
+        "@rpath/LiteRt.framework/LiteRt" \
+        "$DEST/LiteRt"
+    case "$SLICE" in
+        ios-arm64)           set_ios_min "$DEST/LiteRt" ios ;;
+        ios-arm64-simulator) set_ios_min "$DEST/LiteRt" iossim ;;
+    esac
+    write_plist "$DEST" "LiteRt" "com.google.LiteRt"
+    codesign --force --sign - "$DEST/LiteRt"
+    info "Built LiteRt slice: $SLICE"
+}
+
+make_litert_slice "ios-arm64" "$LITERT_DEVICE_DYLIB"
+make_litert_slice "ios-arm64-simulator" "$LITERT_SIM_DYLIB"
+
+# ---------------------------------------------------------------------------
+# 6. Create the five xcframeworks
 # ---------------------------------------------------------------------------
 
 rm -rf "$FRAMEWORKS_DIR/LiteRTLM.xcframework" \
        "$FRAMEWORKS_DIR/GemmaModelConstraintProvider.xcframework" \
        "$FRAMEWORKS_DIR/LiteRtMetalAccelerator.xcframework" \
-       "$FRAMEWORKS_DIR/LiteRtTopKMetalSampler.xcframework"
+       "$FRAMEWORKS_DIR/LiteRtTopKMetalSampler.xcframework" \
+       "$FRAMEWORKS_DIR/LiteRt.xcframework"
 
 xcodebuild -create-xcframework \
     -framework "$WORK_DIR/core/ios-arm64/CLiteRTLM.framework" \
@@ -309,8 +364,14 @@ xcodebuild -create-xcframework \
     -framework "$WORK_DIR/topk/ios-arm64-simulator/LiteRtTopKMetalSampler.framework" \
     -output "$FRAMEWORKS_DIR/LiteRtTopKMetalSampler.xcframework" >/dev/null
 
+xcodebuild -create-xcframework \
+    -framework "$WORK_DIR/litert/ios-arm64/LiteRt.framework" \
+    -framework "$WORK_DIR/litert/ios-arm64-simulator/LiteRt.framework" \
+    -output "$FRAMEWORKS_DIR/LiteRt.xcframework" >/dev/null
+
 info "Wrote:"
 info "  $FRAMEWORKS_DIR/LiteRTLM.xcframework"
 info "  $FRAMEWORKS_DIR/GemmaModelConstraintProvider.xcframework"
 info "  $FRAMEWORKS_DIR/LiteRtMetalAccelerator.xcframework"
 info "  $FRAMEWORKS_DIR/LiteRtTopKMetalSampler.xcframework"
+info "  $FRAMEWORKS_DIR/LiteRt.xcframework"

@@ -26,6 +26,10 @@ let package = Package(
             name: "LiteRtTopKMetalSampler",
             path: "Frameworks/LiteRtTopKMetalSampler.xcframework"
         ),
+        .binaryTarget(
+            name: "LiteRt",
+            path: "Frameworks/LiteRt.xcframework"
+        ),
         .target(
             name: "LiteRTLMSwift",
             dependencies: [
@@ -33,6 +37,7 @@ let package = Package(
                 "GemmaModelConstraintProvider",
                 "LiteRtMetalAccelerator",
                 "LiteRtTopKMetalSampler",
+                "LiteRt",
             ],
             path: "Sources/LiteRTLMSwift"
         ),

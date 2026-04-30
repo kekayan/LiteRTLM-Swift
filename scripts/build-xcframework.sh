@@ -210,8 +210,10 @@ cp "$SIM_DYLIB_SRC" "$SIM_DYLIB"
 
 METAL_DEVICE="$LITERT_LM_DIR/prebuilt/ios_arm64/libLiteRtMetalAccelerator.dylib"
 METAL_SIM="$LITERT_LM_DIR/prebuilt/ios_sim_arm64/libLiteRtMetalAccelerator.dylib"
+LITERT_DEVICE="$LITERT_LM_DIR/prebuilt/ios_arm64/libLiteRt.dylib"
+LITERT_SIM="$LITERT_LM_DIR/prebuilt/ios_sim_arm64/libLiteRt.dylib"
 
-for DYLIB in "$METAL_DEVICE" "$METAL_SIM"; do
+for DYLIB in "$METAL_DEVICE" "$METAL_SIM" "$LITERT_DEVICE" "$LITERT_SIM"; do
     if [ ! -f "$DYLIB" ] || ! file "$DYLIB" | grep -q 'Mach-O'; then
         error "Prebuilt dylib missing or not a Mach-O binary: $DYLIB"
     fi
@@ -219,6 +221,8 @@ done
 
 info "Metal device dylib:  $(du -h "$METAL_DEVICE" | cut -f1)"
 info "Metal sim dylib:     $(du -h "$METAL_SIM" | cut -f1)"
+info "LiteRt device dylib: $(du -h "$LITERT_DEVICE" | cut -f1)"
+info "LiteRt sim dylib:    $(du -h "$LITERT_SIM" | cut -f1)"
 
 # ---------------------------------------------------------------------------
 # 4c. LiteRT TopK Metal sampler prebuilt (device only; sim stub added later)
@@ -334,7 +338,7 @@ xcodebuild -create-xcframework \
     -output "$OUTPUT_DIR"
 
 info "Repackaging into App-Store-compliant xcframeworks..."
-"$SCRIPT_DIR/repackage-xcframeworks.sh"
+LITERT_DEVICE_DYLIB="$LITERT_DEVICE" LITERT_SIM_DYLIB="$LITERT_SIM" "$SCRIPT_DIR/repackage-xcframeworks.sh"
 
 # ---------------------------------------------------------------------------
 # 7. Verify
@@ -342,11 +346,11 @@ info "Repackaging into App-Store-compliant xcframeworks..."
 
 info "Verifying xcframeworks..."
 
-for XCF in LiteRTLM GemmaModelConstraintProvider LiteRtMetalAccelerator LiteRtTopKMetalSampler; do
+for XCF in LiteRTLM GemmaModelConstraintProvider LiteRtMetalAccelerator LiteRtTopKMetalSampler LiteRt; do
     XCF_PATH="$PROJECT_DIR/Frameworks/$XCF.xcframework"
     [ -d "$XCF_PATH" ] || error "Missing $XCF_PATH"
     info "  $XCF.xcframework: $(du -sh "$XCF_PATH" | cut -f1)"
 done
 
-info "Done! Four xcframeworks ready under Frameworks/"
+info "Done! Five xcframeworks ready under Frameworks/"
 # WORK_DIR is cleaned up automatically by the EXIT trap
