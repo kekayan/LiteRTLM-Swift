@@ -154,7 +154,6 @@ clean_core_slice() {
             "@rpath/GemmaModelConstraintProvider.framework/GemmaModelConstraintProvider" \
             "$DEST/CLiteRTLM"
         # Add @loader_path/.. so sibling frameworks resolve from app Frameworks/.
-        # The existing @loader_path rpath stays (harmless; nothing resolves there now).
         install_name_tool -add_rpath "@loader_path/.." "$DEST/CLiteRTLM" 2>/dev/null || true
     fi
     codesign --force --sign - "$DEST/CLiteRTLM"

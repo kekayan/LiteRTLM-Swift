@@ -12,7 +12,6 @@
 #
 # Optional environment:
 #   LITERT_LM_REF=<git ref>       Checkout this upstream ref when cloning.
-#   LITERT_PREBUILTS_URL=<url>    Override LiteRT accelerator prebuilts zip.
 #
 # If no path is provided, clones the repo to a temp directory.
 
@@ -62,12 +61,14 @@ LITERT_LM_DIR="$(cd "$LITERT_LM_DIR" && pwd)"
 UPSTREAM_REV="$(git -C "$LITERT_LM_DIR" rev-parse --short=12 HEAD 2>/dev/null || true)"
 info "Using LiteRT-LM source at: $LITERT_LM_DIR${UPSTREAM_REV:+ ($UPSTREAM_REV)}"
 
+# Pull all prebuilt dylibs via Git LFS (Metal accelerator, LiteRt runtime, TopK sampler)
+info "Pulling prebuilt dylibs via git lfs..."
+git -C "$LITERT_LM_DIR" lfs pull --include "prebuilt/ios_arm64/*" --include "prebuilt/ios_sim_arm64/*"
+
 TOPK_CANDIDATE="$LITERT_LM_DIR/prebuilt/ios_arm64/libLiteRtTopKMetalSampler.dylib"
 TOPK_DEVICE=""
 if [ -f "$TOPK_CANDIDATE" ] && file "$TOPK_CANDIDATE" | grep -q 'Mach-O'; then
     TOPK_DEVICE="$TOPK_CANDIDATE"
-elif [ -f "$TOPK_CANDIDATE" ] && head -1 "$TOPK_CANDIDATE" | grep -q 'git-lfs'; then
-    error "TopK Metal sampler is a Git LFS pointer, not a dylib. Run: git -C \"$LITERT_LM_DIR\" lfs pull --include prebuilt/ios_arm64/libLiteRtTopKMetalSampler.dylib"
 else
     error "TopK Metal sampler prebuilt not found at $TOPK_CANDIDATE"
 fi
@@ -95,6 +96,18 @@ def ios_shared_engine(**kwargs):
 STUB
 fi
 
+# If the target already exists but has linkstatic (from a prior script run), strip
+# both the linkstatic line and the old _LiteRt* exported_symbol line so we add the
+# corrected version below.
+if grep -q 'linkstatic = True' "$LITERT_LM_DIR/c/BUILD"; then
+    info "Removing stale linkstatic from libLiteRTLMEngine.dylib target..."
+    sed -i '' '/linkstatic = True,/d' "$LITERT_LM_DIR/c/BUILD"
+fi
+if grep -q 'exported_symbol,_LiteRt' "$LITERT_LM_DIR/c/BUILD"; then
+    info "Removing stale _LiteRt* exported_symbol from libLiteRTLMEngine.dylib target..."
+    sed -i '' '/exported_symbol,_LiteRt/d' "$LITERT_LM_DIR/c/BUILD"
+fi
+
 if ! grep -q 'libLiteRTLMEngine\.dylib' "$LITERT_LM_DIR/c/BUILD"; then
     info "Adding libLiteRTLMEngine.dylib target (not present in this version)..."
     # litert_lm_logging.cc/.h were removed in upstream main; include them only
@@ -115,10 +128,8 @@ $LOGGING_SRCS
     ],
     linkopts = [
         "-Wl,-exported_symbol,_litert_lm_*",
-        "-Wl,-exported_symbol,_LiteRt*",
     ],
     linkshared = True,
-    linkstatic = True,
     visibility = ["//visibility:public"],
     deps = ENGINE_COMMON_DEPS + [
         "//runtime/core:engine_impl",
@@ -192,46 +203,26 @@ SIM_DYLIB="$WORK_DIR/libLiteRTLMEngine-sim.dylib"
 cp "$SIM_DYLIB_SRC" "$SIM_DYLIB"
 
 # ---------------------------------------------------------------------------
-# 4b. Fetch LiteRT GPU/Metal accelerator prebuilt (not buildable from source)
+# 4b. Locate prebuilt dylibs from the LiteRT-LM repo
 # ---------------------------------------------------------------------------
-# The Metal accelerator plugin (libLiteRtMetalAccelerator.dylib) depends on
-# Google-internal ml_drift code and is not open-sourced. Upstream ships a
-# prebuilt in the litert_prebuilts zip; we vendor it into the framework so
-# the engine's dlopen() finds it at runtime via @rpath / @loader_path.
-#
-# Without this, `litert_lm_engine_create` returns NULL for backend="gpu"
-# and the Swift wrapper falls back to CPU.
-#
-# See: https://github.com/google-ai-edge/LiteRT-LM/issues/1050
+# All GPU/Metal plugin dylibs ship as Git LFS prebuilts under prebuilt/ in the
+# upstream repo. We pulled them above; just verify and set paths here.
 
-PREBUILTS_URL="${LITERT_PREBUILTS_URL:-https://storage.googleapis.com/litert/binaries/latest/litert_prebuilts.zip}"
-PREBUILTS_ZIP="$WORK_DIR/litert_prebuilts.zip"
-PREBUILTS_DIR="$WORK_DIR/litert_prebuilts"
+METAL_DEVICE="$LITERT_LM_DIR/prebuilt/ios_arm64/libLiteRtMetalAccelerator.dylib"
+METAL_SIM="$LITERT_LM_DIR/prebuilt/ios_sim_arm64/libLiteRtMetalAccelerator.dylib"
 
-info "Downloading LiteRT accelerator prebuilts..."
-curl -fL --retry 3 "$PREBUILTS_URL" -o "$PREBUILTS_ZIP"
-mkdir -p "$PREBUILTS_DIR"
-unzip -q "$PREBUILTS_ZIP" -d "$PREBUILTS_DIR"
+for DYLIB in "$METAL_DEVICE" "$METAL_SIM"; do
+    if [ ! -f "$DYLIB" ] || ! file "$DYLIB" | grep -q 'Mach-O'; then
+        error "Prebuilt dylib missing or not a Mach-O binary: $DYLIB"
+    fi
+done
 
-METAL_DEVICE="$PREBUILTS_DIR/ios_arm64/libLiteRtMetalAccelerator.dylib"
-METAL_SIM="$PREBUILTS_DIR/ios_sim_arm64/libLiteRtMetalAccelerator.dylib"
-
-if [ ! -f "$METAL_DEVICE" ] || [ ! -f "$METAL_SIM" ]; then
-    warn "Metal accelerator dylib not found in prebuilts zip. Contents:"
-    find "$PREBUILTS_DIR" -name 'libLiteRt*.dylib' || true
-    error "Expected ios_arm64/ and ios_sim_arm64/ libLiteRtMetalAccelerator.dylib"
-fi
-
-info "Metal device dylib: $(du -h "$METAL_DEVICE" | cut -f1)"
-info "Metal simulator dylib: $(du -h "$METAL_SIM" | cut -f1)"
+info "Metal device dylib:  $(du -h "$METAL_DEVICE" | cut -f1)"
+info "Metal sim dylib:     $(du -h "$METAL_SIM" | cut -f1)"
 
 # ---------------------------------------------------------------------------
-# 4c. Locate optional LiteRT TopK Metal sampler prebuilt
+# 4c. LiteRT TopK Metal sampler prebuilt (device only; sim stub added later)
 # ---------------------------------------------------------------------------
-# LiteRT-LM dynamically loads libLiteRtTopKMetalSampler.dylib for GPU sampling.
-# Upstream currently ships the iOS device dylib through Git LFS under prebuilt/.
-# There is no iOS simulator prebuilt, so the repackager creates a simulator
-# stub slice for SwiftPM resolution.
 
 info "Using TopK Metal sampler from: $TOPK_DEVICE"
 
@@ -357,5 +348,5 @@ for XCF in LiteRTLM GemmaModelConstraintProvider LiteRtMetalAccelerator LiteRtTo
     info "  $XCF.xcframework: $(du -sh "$XCF_PATH" | cut -f1)"
 done
 
-info "Done! Three xcframeworks ready under Frameworks/"
+info "Done! Four xcframeworks ready under Frameworks/"
 # WORK_DIR is cleaned up automatically by the EXIT trap
