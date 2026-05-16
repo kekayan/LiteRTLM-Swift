@@ -377,7 +377,7 @@ struct EngineView: View {
 
 | Method | Description |
 |--------|-------------|
-| `init(modelPath:backend:)` | Create engine. `backend`: `"cpu"` (default, recommended) or `"gpu"` (experimental, Metal) |
+| `init(modelPath:backend:enableSpeculativeDecoding:)` | Create engine. `backend`: `"cpu"` (default) or `"gpu"` (Metal). Set `enableSpeculativeDecoding: true` for Gemma 4 MTP on GPU |
 | `load()` | Load the `.litertlm` model. Call once, reuse across inferences |
 | `unload()` | Free model memory |
 | `generate(prompt:temperature:maxTokens:)` | One-shot text generation. Prompt must use Gemma turn markers |

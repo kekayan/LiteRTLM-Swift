@@ -52,6 +52,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     private let visionBackend: String?
     /// When `nil`, derived in `load()` from `backend` (GPU → `"cpu"` for Gemma E2B audio adapter constraints).
     private let audioBackend: String?
+    private let enableSpeculativeDecoding: Bool
 
     private var engine: OpaquePointer?  // LiteRtLmEngine*
     /// `.default` QoS is deliberate: the streaming paths below block on a
@@ -102,16 +103,20 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     ///     showed “GPU” for the main LM. Pass `"gpu"` explicitly if your model supports it.
     ///   - audioBackend: Audio adapter backend, or `nil` to default **`"cpu"`** (Gemma E2B audio is CPU-only;
     ///     avoids `Audio backend constraint mismatch` when the main backend is `"gpu"`).
+    ///   - enableSpeculativeDecoding: Enables Gemma 4 MTP/speculative decoding. Recommended for
+    ///     MTP-capable Gemma 4 models on GPU backends.
     public init(
         modelPath: URL,
         backend: String = "cpu",
         visionBackend: String? = nil,
-        audioBackend: String? = nil
+        audioBackend: String? = nil,
+        enableSpeculativeDecoding: Bool = false
     ) {
         self.modelPath = modelPath
         self.backend = backend
         self.visionBackend = visionBackend
         self.audioBackend = audioBackend
+        self.enableSpeculativeDecoding = enableSpeculativeDecoding
     }
 
     deinit {
@@ -158,8 +163,9 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         let backendStr = self.backend
         let visionStr = visionBackend?.lowercased() ?? "cpu"
         let audioStr = audioBackend?.lowercased() ?? "cpu"
+        let enableSpeculativeDecoding = self.enableSpeculativeDecoding
         Self.log.info(
-            "Loading model: \(self.modelPath.lastPathComponent), backend: \(self.backend) (vision: \(visionStr), audio: \(audioStr))"
+            "Loading model: \(self.modelPath.lastPathComponent), backend: \(self.backend) (vision: \(visionStr), audio: \(audioStr), speculative: \(enableSpeculativeDecoding))"
         )
 
         let startTime = CFAbsoluteTimeGetCurrent()
@@ -184,6 +190,9 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                         }
 
                         litert_lm_engine_settings_set_max_num_tokens(settings, maxNumTokens)
+                        if enableSpeculativeDecoding {
+                            litert_lm_engine_settings_set_enable_speculative_decoding(settings, true)
+                        }
 
                         let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
                             .appendingPathComponent("litertlm_cache").path
