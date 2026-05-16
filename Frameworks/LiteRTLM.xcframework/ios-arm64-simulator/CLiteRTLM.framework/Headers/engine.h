@@ -482,6 +482,37 @@ LITERT_LM_C_API_EXPORT
 int litert_lm_responses_get_token_length_at(const LiteRtLmResponses* responses,
                                             int index);
 
+// Returns whether the response contains token scores at the given index.
+//
+// @param responses The responses object.
+// @param index The index of the response.
+// @return true if token scores are available at the given index, false
+// otherwise.
+LITERT_LM_C_API_EXPORT
+bool litert_lm_responses_has_token_scores_at(const LiteRtLmResponses* responses,
+                                             int index);
+
+// Returns the number of tokens for which scores are present at a given index.
+//
+// @param responses The responses object.
+// @param index The index of the response.
+// @return The number of token scores. Returns 0 if index is out of bounds or no
+//   token scores are present.
+LITERT_LM_C_API_EXPORT
+int litert_lm_responses_get_num_token_scores_at(
+    const LiteRtLmResponses* responses, int index);
+
+// Returns the token scores at a given index.
+//
+// @param responses The responses object.
+// @param index The index of the response.
+// @return A pointer to the internal array of token scores. Returns NULL if
+// index
+//   is out of bounds or no token scores are present.
+LITERT_LM_C_API_EXPORT
+const float* litert_lm_responses_get_token_scores_at(
+    const LiteRtLmResponses* responses, int index);
+
 // Retrieves the benchmark information from the session. The caller is
 // responsible for destroying the benchmark info using
 // `litert_lm_benchmark_info_delete`.

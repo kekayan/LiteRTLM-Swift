@@ -1,0 +1,42 @@
+name: Build XCFrameworks
+
+on:
+  workflow_dispatch:
+    inputs:
+      litert_lm_ref:
+        description: "LiteRT-LM git ref to build"
+        required: true
+        default: "v0.11.0"
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout package
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          brew install bazelisk git-lfs
+          git lfs install
+
+      - name: Checkout LiteRT-LM
+        run: |
+          git clone https://github.com/google-ai-edge/LiteRT-LM.git /tmp/LiteRT-LM
+          cd /tmp/LiteRT-LM
+          git checkout "${{ inputs.litert_lm_ref }}"
+          git lfs pull --include "prebuilt/ios_arm64/*" --include "prebuilt/ios_sim_arm64/*"
+
+      - name: Build XCFrameworks
+        run: ./scripts/build-xcframework.sh /tmp/LiteRT-LM
+
+      - name: Verify package manifest
+        run: swift package dump-package >/dev/null
+
+      - name: Upload XCFrameworks
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiteRTLM-Swift-XCFrameworks-${{ inputs.litert_lm_ref }}
+          path: Frameworks/*.xcframework

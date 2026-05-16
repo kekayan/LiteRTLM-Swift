@@ -12,8 +12,10 @@
 #
 # Optional environment:
 #   LITERT_LM_REF=<git ref>       Checkout this upstream ref when cloning.
+#                                  Default: v0.11.0
 #
-# If no path is provided, clones the repo to a temp directory.
+# If no path is provided, clones the repo to a temp directory at the pinned
+# release above. Set LITERT_LM_REF=main to build from upstream HEAD.
 
 set -euo pipefail
 
@@ -41,14 +43,11 @@ LITERT_LM_DIR="${1:-}"
 
 if [ -z "$LITERT_LM_DIR" ]; then
     LITERT_LM_DIR="$WORK_DIR/LiteRT-LM"
-    info "Cloning LiteRT-LM source..."
-    if [ -n "${LITERT_LM_REF:-}" ]; then
-        git clone --filter=blob:none --no-checkout https://github.com/google-ai-edge/LiteRT-LM.git "$LITERT_LM_DIR"
-        git -C "$LITERT_LM_DIR" fetch --depth 1 origin "$LITERT_LM_REF"
-        git -C "$LITERT_LM_DIR" checkout --detach FETCH_HEAD
-    else
-        git clone --depth 1 https://github.com/google-ai-edge/LiteRT-LM.git "$LITERT_LM_DIR"
-    fi
+    LITERT_LM_REF="${LITERT_LM_REF:-v0.11.0}"
+    info "Cloning LiteRT-LM source at $LITERT_LM_REF..."
+    git clone --filter=blob:none --no-checkout https://github.com/google-ai-edge/LiteRT-LM.git "$LITERT_LM_DIR"
+    git -C "$LITERT_LM_DIR" fetch --depth 1 origin "$LITERT_LM_REF"
+    git -C "$LITERT_LM_DIR" checkout --detach FETCH_HEAD
 fi
 
 if [ ! -f "$LITERT_LM_DIR/c/BUILD" ]; then
@@ -82,9 +81,9 @@ info "TopK Metal sampler device dylib: $(du -h "$TOPK_DEVICE" | cut -f1)"
 # 1. ios_engine.bzl stub — HEAD's c/BUILD loads `:ios_engine.bzl` which isn't
 #    shipped yet. Without the stub Bazel can't parse the BUILD file at all.
 #
-# 2. cc_binary dylib target — releases up to v0.10.2 only define cc_library
-#    targets (:engine, :engine_cpu). The cc_binary that produces the shared
-#    library was added later. We append it if missing.
+# 2. cc_binary dylib target — published releases through v0.11.0 only define
+#    cc_library targets (:engine, :engine_cpu). We append the cc_binary that
+#    produces the shared library if it is missing.
 
 if [ ! -f "$LITERT_LM_DIR/c/ios_engine.bzl" ] && grep -q 'ios_engine\.bzl' "$LITERT_LM_DIR/c/BUILD"; then
     info "Creating stub ios_engine.bzl (missing from upstream)..."
@@ -111,7 +110,7 @@ fi
 if ! grep -q 'libLiteRTLMEngine\.dylib' "$LITERT_LM_DIR/c/BUILD"; then
     info "Adding libLiteRTLMEngine.dylib target (not present in this version)..."
     # litert_lm_logging.cc/.h were removed in upstream main; include them only
-    # when present (needed for older pinned commits like 40dee845).
+    # when present (needed for older pinned commits).
     LOGGING_SRCS=""
     if [ -f "$LITERT_LM_DIR/c/litert_lm_logging.cc" ]; then
         LOGGING_SRCS='        "litert_lm_logging.cc",

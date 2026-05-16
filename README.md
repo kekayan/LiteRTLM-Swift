@@ -37,7 +37,7 @@ Add to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/mylovelycodes/LiteRTLM-Swift.git", from: "0.1.0")
+    .package(url: "https://github.com/kekayan/LiteRTLM-Swift.git", from: "0.1.0")
 ],
 targets: [
     .target(
@@ -87,6 +87,14 @@ Tick **"Based on dependency analysis"** off (or set `alwaysOutOfDate = 1` in the
 At launch, dyld resolves the app's pre-patch `LC_LOAD_DYLIB @rpath/...framework/...` entries via rpath, loads the files, and indexes each loaded image under the patched `LC_ID_DYLIB` leaf. When the engine later calls `dlopen("libLiteRtMetalAccelerator.dylib")` or `dlopen("libLiteRtTopKMetalSampler.dylib")`, dyld's install-name cache can answer with the existing handle.
 
 If you only ever use `backend: "cpu"` (the default), you don't need this phase.
+
+### Duplicate Obj-C class warnings
+
+At launch you'll see `objc[...]: Class SRLRegistry is implemented in both ...LiteRt.framework... and ...LiteRtMetalAccelerator.framework...` (and similar for ~60 `GTM*`/`GIP*`/`SRL*`/`GSC*` classes across the three Metal-related frameworks).
+
+These are benign in this build: every framework is compiled from the same upstream LiteRT-LM commit, so each duplicate class is a byte-identical statically-linked copy of the same Google internal logging/registry sources. The Obj-C runtime keeps the first-loaded copy and dispatches all calls through it; behavior is stable. The "may cause spurious casting failures" wording in the warning applies when duplicates have *differing* layouts — not the case here.
+
+To silence the noise during development, add `OBJC_DISABLE_DUPLICATE_CLASS_CHECK = YES` to your scheme's **Run > Arguments > Environment Variables**. The variable only suppresses the warning print; it has no effect on App Store builds (where the scheme isn't used) and doesn't change runtime behavior.
 
 ## Quick Start
 
@@ -507,7 +515,7 @@ This repo ships prebuilt xcframeworks under `Frameworks/`. If you want to rebuil
 ./scripts/build-xcframework.sh
 
 # Build a specific upstream ref
-LITERT_LM_REF=40dee845d53708406179e6d5da9177faf259176e ./scripts/build-xcframework.sh
+LITERT_LM_REF=v0.11.0 ./scripts/build-xcframework.sh
 
 # Or point to an existing local checkout
 ./scripts/build-xcframework.sh ~/Dev/LiteRT-LM
@@ -515,13 +523,12 @@ LITERT_LM_REF=40dee845d53708406179e6d5da9177faf259176e ./scripts/build-xcframewo
 
 The script will:
 1. Clone (or use existing) [google-ai-edge/LiteRT-LM](https://github.com/google-ai-edge/LiteRT-LM) source
-2. Patch `c/BUILD` if needed — adds the `cc_binary` dylib target (missing in v0.10.2 and earlier) and stubs `ios_engine.bzl` (missing in HEAD)
+2. Patch `c/BUILD` if needed — adds the `cc_binary` dylib target (missing in published releases through v0.11.0) and stubs `ios_engine.bzl` (missing in some HEAD snapshots)
 3. Build `libLiteRTLMEngine.dylib` for `ios_arm64` (device) and `ios_sim_arm64` (simulator)
-4. Download the LiteRT Metal accelerator prebuilt zip
-5. Wrap the upstream Git LFS `prebuilt/ios_arm64/libLiteRtTopKMetalSampler.dylib` when present
-6. Package App-Store-compliant sibling xcframeworks under `Frameworks/`
+4. Pull the upstream iOS prebuilts from Git LFS (`LiteRt`, Metal accelerator, TopK sampler)
+5. Package App-Store-compliant sibling xcframeworks under `Frameworks/`
 
-You can also run the **Build XCFrameworks** GitHub Action manually. It checks out the requested upstream LiteRT-LM ref, pulls the TopK sampler LFS object, runs the same build script, verifies the package manifest, and uploads the generated xcframeworks as an artifact.
+You can also run the **Build XCFrameworks** GitHub Action manually. It checks out the requested upstream LiteRT-LM ref, pulls the iOS prebuilt LFS objects, runs the same build script, verifies the package manifest, and uploads the generated xcframeworks as an artifact.
 
 ### Option B: Manual Step-by-Step
 
@@ -536,7 +543,7 @@ cd LiteRT-LM
 
 The upstream BUILD file may need patching depending on the version:
 
-**a) Releases up to v0.10.2** — the `cc_binary` target for the shared library doesn't exist yet. Append it:
+**a) Published releases through v0.11.0** — the `cc_binary` target for the shared library doesn't exist yet. Append it:
 
 ```bash
 cat >> c/BUILD << 'EOF'
@@ -562,7 +569,7 @@ cc_binary(
 EOF
 ```
 
-**b) Latest HEAD** — `c/BUILD` loads `ios_engine.bzl` which isn't published. Create a stub:
+**b) Some upstream HEAD snapshots** — `c/BUILD` loads `ios_engine.bzl` which isn't published. Create a stub:
 
 ```bash
 cat > c/ios_engine.bzl << 'EOF'
@@ -708,7 +715,7 @@ nm -gU Frameworks/LiteRTLM.xcframework/ios-arm64/CLiteRTLM.framework/CLiteRTLM |
 
 | Issue | Solution |
 |-------|----------|
-| `no such target '//c:libLiteRTLMEngine.dylib'` | Two possible causes: (1) v0.10.2 and earlier don't define the `cc_binary` dylib target — append it per Step 2a; (2) HEAD loads a missing `ios_engine.bzl` which breaks BUILD parsing — create the stub per Step 2b |
+| `no such target '//c:libLiteRTLMEngine.dylib'` | Two possible causes: (1) published releases through v0.11.0 don't define the `cc_binary` dylib target — append it per Step 2a; (2) some HEAD snapshots load a missing `ios_engine.bzl` which breaks BUILD parsing — create the stub per Step 2b |
 | `no such package '@build_bazel_apple_support'` | Run `bazel sync` to fetch external dependencies |
 | Xcode SDK not found | Ensure Xcode is selected: `sudo xcode-select -s /Applications/Xcode.app` |
 | Build takes very long | First build downloads ~10 GB of deps. Subsequent builds use cache |
