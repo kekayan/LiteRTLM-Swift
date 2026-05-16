@@ -90,11 +90,7 @@ If you only ever use `backend: "cpu"` (the default), you don't need this phase.
 
 ### Duplicate Obj-C class warnings
 
-At launch you'll see `objc[...]: Class SRLRegistry is implemented in both ...LiteRt.framework... and ...LiteRtMetalAccelerator.framework...` (and similar for ~60 `GTM*`/`GIP*`/`SRL*`/`GSC*` classes across the three Metal-related frameworks).
-
-These are benign in this build: every framework is compiled from the same upstream LiteRT-LM commit, so each duplicate class is a byte-identical statically-linked copy of the same Google internal logging/registry sources. The Obj-C runtime keeps the first-loaded copy and dispatches all calls through it; behavior is stable. The "may cause spurious casting failures" wording in the warning applies when duplicates have *differing* layouts — not the case here.
-
-To silence the noise during development, add `OBJC_DISABLE_DUPLICATE_CLASS_CHECK = YES` to your scheme's **Run > Arguments > Environment Variables**. The variable only suppresses the warning print; it has no effect on App Store builds (where the scheme isn't used) and doesn't change runtime behavior.
+Google's prebuilt `LiteRt`, Metal accelerator, and TopK sampler dylibs statically include the same private Obj-C logging/registry classes. During packaging, the plugin framework copies are renamed in-place with same-length private prefixes so launch does not emit duplicate-class warnings while `LiteRt.framework` keeps the original class names and `_LiteRt*` exports.
 
 ## Quick Start
 

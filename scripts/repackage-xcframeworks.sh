@@ -65,6 +65,66 @@ set_ios_min() {
     xcrun vtool -set-build-version "$PLATFORM" 17.0 26.2 -tool 3 1230.1 -replace -output "$BIN" "$BIN" >/dev/null
 }
 
+# Google's prebuilt LiteRt, Metal accelerator, and TopK sampler dylibs each
+# statically include the same private Obj-C logging/registry classes. When all
+# three frameworks are embedded, objc emits duplicate-class warnings at launch.
+# We cannot remove LiteRt.framework because TopK has unresolved _LiteRt* imports.
+# Instead, rename those private classes inside plugin dylibs in-place. Each
+# replacement is the same byte length, preserving Mach-O layout.
+rename_private_objc_classes() {
+    local BIN="$1" SRL_PREFIX="$2" GIP_PREFIX="$3" GSC_PREFIX="$4" GTM_PREFIX="$5"
+    local DUP_COUNT
+    DUP_COUNT="$(nm -m "$BIN" 2>/dev/null | grep -E -c 'OBJC_CLASS_\$_(SRL|GIP|GSC|GTM)' || true)"
+    [ "$DUP_COUNT" = "0" ] && return
+
+    info "Renaming $DUP_COUNT private Obj-C classes in $(basename "$BIN")"
+    SRL_PREFIX="$SRL_PREFIX" \
+    GIP_PREFIX="$GIP_PREFIX" \
+    GSC_PREFIX="$GSC_PREFIX" \
+    GTM_PREFIX="$GTM_PREFIX" \
+    perl -0pi -e '
+        my $srl = $ENV{"SRL_PREFIX"};
+        my $gip = $ENV{"GIP_PREFIX"};
+        my $gsc = $ENV{"GSC_PREFIX"};
+        my $gtm = $ENV{"GTM_PREFIX"};
+        s/SRLMemoizingScope/${srl}MemoizingScope/g;
+        s/SRLRegistry/${srl}Registry/g;
+        s/SRLImplementationConfiguration/${srl}ImplementationConfiguration/g;
+        s/SRLImplementation/${srl}Implementation/g;
+        s/SRLScopeTagSetCodableWrapper/${srl}ScopeTagSetCodableWrapper/g;
+        s/SRLClassProtocolType/${srl}ClassProtocolType/g;
+        s/SRLClassType/${srl}ClassType/g;
+        s/SRLProtocolType/${srl}ProtocolType/g;
+        s/GSCErrorDescription/${gsc}ErrorDescription/g;
+        s/GSCErrorHandler/${gsc}ErrorHandler/g;
+        s/GIPLoggingReroutingGTMLogger/${gip}LoggingReroutingGTMLogger/g;
+        s/GIPLogMultiplexer/${gip}LogMultiplexer/g;
+        s/GIPDefaultMinimumLogLevelFilter/${gip}DefaultMinimumLogLevelFilter/g;
+        s/GIPSystemLoggerFormatter/${gip}SystemLoggerFormatter/g;
+        s/GIPSystemLogger/${gip}SystemLogger/g;
+        s/GIPLogAddressCallstack/${gip}LogAddressCallstack/g;
+        s/GIPLogNoFilter/${gip}LogNoFilter/g;
+        s/GIPLogDropAllFilter/${gip}LogDropAllFilter/g;
+        s/GIPLogMinimumLevelFilter/${gip}LogMinimumLevelFilter/g;
+        s/GIPLogComponentFilter/${gip}LogComponentFilter/g;
+        s/GIPLogLogicalOrFilter/${gip}LogLogicalOrFilter/g;
+        s/GIPLogLogicalAndFilter/${gip}LogLogicalAndFilter/g;
+        s/GIPLogMessage/${gip}LogMessage/g;
+        s/GIPLogMetadata/${gip}LogMetadata/g;
+        s/GIPSafeStringParameter/${gip}SafeStringParameter/g;
+        s/GIPSafeNumberParameter/${gip}SafeNumberParameter/g;
+        s/GIPSafeErrorParameter/${gip}SafeErrorParameter/g;
+        s/GTMLogger/${gtm}Logger/g;
+        s/GTMLogBasicFormatter/${gtm}LogBasicFormatter/g;
+        s/GTMLogStandardFormatter/${gtm}LogStandardFormatter/g;
+        s/GTMLogLevelFilter/${gtm}LogLevelFilter/g;
+        s/GTMLogNoFilter/${gtm}LogNoFilter/g;
+        s/GTMLogAllowedLevelFilter/${gtm}LogAllowedLevelFilter/g;
+        s/GTMLogMininumLevelFilter/${gtm}LogMininumLevelFilter/g;
+        s/GTMLogMaximumLevelFilter/${gtm}LogMaximumLevelFilter/g;
+    ' "$BIN"
+}
+
 [ -d "$SRC_XCF" ] || error "Source xcframework missing: $SRC_XCF"
 [ -d "$SRC_XCF/ios-arm64/CLiteRTLM.framework" ] || error "Missing device slice"
 [ -d "$SRC_XCF/ios-arm64-simulator/CLiteRTLM.framework" ] || error "Missing sim slice"
@@ -252,6 +312,7 @@ make_metal_slice() {
         ios-arm64)           set_ios_min "$DEST/LiteRtMetalAccelerator" ios ;;
         ios-arm64-simulator) set_ios_min "$DEST/LiteRtMetalAccelerator" iossim ;;
     esac
+    rename_private_objc_classes "$DEST/LiteRtMetalAccelerator" MSR MIP MSC MTM
     write_plist "$DEST" "LiteRtMetalAccelerator" "com.google.LiteRtMetalAccelerator"
     codesign --force --sign - "$DEST/LiteRtMetalAccelerator"
     info "Built Metal slice: $SLICE"
@@ -284,6 +345,7 @@ make_topk_slice() {
         ios-arm64)           set_ios_min "$DEST/LiteRtTopKMetalSampler" ios ;;
         ios-arm64-simulator) set_ios_min "$DEST/LiteRtTopKMetalSampler" iossim ;;
     esac
+    rename_private_objc_classes "$DEST/LiteRtTopKMetalSampler" KSR KIP KSC KTM
     write_plist "$DEST" "LiteRtTopKMetalSampler" "com.google.LiteRtTopKMetalSampler"
     codesign --force --sign - "$DEST/LiteRtTopKMetalSampler"
     info "Built TopK Metal sampler slice: $SLICE"
